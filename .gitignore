@@ -1,0 +1,38 @@
+# Secrets and local environment
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Tests and tooling
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Local invoice data / generated documents
+data/invoices.json
+data/invoices.json.tmp
+data/ujp_xml/
+data/xml/
+*.db
+data/db_encryption.key
+output/
+data/invoices_export.xlsx
+invoices.xlsx
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.env
