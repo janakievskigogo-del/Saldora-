@@ -103,7 +103,18 @@ def _ensure_sqlite_directory(url_string: str) -> None:
         return
     directory = os.path.dirname(database)
     if directory:
-        os.makedirs(directory, exist_ok=True)
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError as exc:
+            # Read-only deployment filesystem (e.g. Vercel bundle): never
+            # crash at import time — the engine creation below still
+            # succeeds and the first write surfaces a clear error instead.
+            logger.warning(
+                "Could not create SQLite directory %r (%s: %s).",
+                directory,
+                type(exc).__name__,
+                exc,
+            )
 
 
 _ensure_sqlite_directory(DATABASE_URL)
@@ -163,9 +174,22 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 @contextmanager
 def get_db() -> Iterator[Session]:
+    """Yield a session, releasing any open transaction on failure.
+
+    When an exception propagates through the dependency (an endpoint blew up
+    before its own ``rollback``/``commit``), the open transaction is rolled
+    back **before** the session is closed.  This is the transactional
+    backstop for the global ``@app.exception_handler(Exception)`` shield: a
+    failing request can never hold Supabase row/table locks until the pool
+    recycles the connection.
+    """
+
     session = SessionLocal()
     try:
         yield session
+    except Exception:
+        session.rollback()
+        raise
     finally:
         session.close()
 

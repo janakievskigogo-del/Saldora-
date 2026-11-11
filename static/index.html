@@ -5092,6 +5092,14 @@
         if (!res.ok) {
           throw new Error(data.detail || 'Не успеа подготовката за Documenso потпишување.');
         }
+        if (data.status === 'SAVED_LOCALLY') {
+          // Documenso is not configured — the server stored the canvas
+          // signature directly in the database. Not an error.
+          closeDocumensoModal();
+          showToast('Потписот е зачуван директно (Documenso не е конфигуриран).', 'success');
+          refreshAll(true);
+          return;
+        }
         if (!data.signing_url) {
           throw new Error('Documenso не врати линк за потпишување.');
         }

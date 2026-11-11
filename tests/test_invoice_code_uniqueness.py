@@ -289,7 +289,7 @@ def test_unexpected_error_returns_json_500():
     assert res.status_code == 500
     assert res.headers["content-type"].startswith("application/json")
     body = res.json()
-    assert body["message"] == "Failed to process request"
+    assert body["message"] == "Internal server error"
     assert "boom" in body["detail"]
 
 
@@ -313,5 +313,5 @@ def test_unexpected_delivery_note_error_returns_json_500():
     assert res.status_code == 500
     assert res.headers["content-type"].startswith("application/json")
     body = res.json()
-    assert body["message"] == "Failed to process request"
+    assert body["message"] == "Internal server error"
     assert "isp-boom" in body["detail"]

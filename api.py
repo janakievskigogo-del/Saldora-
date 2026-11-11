@@ -27,6 +27,7 @@ import os
 import re
 import secrets
 import string
+import threading
 from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -57,6 +58,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
+import config as config
 from database import get_db as _get_db_context
 from database import init_db
 from documenso_client import (
@@ -85,9 +87,47 @@ load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
-STATIC_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    # exist_ok=True is normally a no-op for an existing directory, but on a
+    # read-only deployment filesystem (Vercel bundle) the kernel can answer
+    # mkdir with EROFS — never let dashboard boot fail on this.
+    STATIC_DIR.mkdir(parents=True, exist_ok=True)
+except OSError as _static_mkdir_error:
+    logger.warning(
+        "Could not ensure static directory %s (%s: %s); serving the bundled "
+        "assets as-is.",
+        STATIC_DIR,
+        type(_static_mkdir_error).__name__,
+        _static_mkdir_error,
+    )
 
-XML_DIR = BASE_DIR / "data" / "xmls"
+# UBL 2.1 XML audit copies. On Vercel the deployment bundle is read-only, so
+# runtime artifacts are relocated to /tmp/saldora/xmls via the Vercel-aware
+# path resolver; locally the project-level data/xmls directory is unchanged.
+XML_DIR = config.resolve_writable_dir(BASE_DIR / "data" / "xmls")
+
+
+def _ensure_writable_dir(path: Path) -> Path | None:
+    """Create ``path`` if possible, returning it; ``None`` when unwritable.
+
+    ``os.makedirs(output_dir, exist_ok=True)`` must never take a request
+    down: on a read-only filesystem (Vercel bundle, frozen container) the
+    ``OSError`` is logged and the caller degrades gracefully (e.g. invoices
+    are still stored in Supabase without a local XML audit copy).
+    """
+
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    except OSError as exc:
+        logger.error(
+            "Output directory %s is not writable (%s: %s); continuing "
+            "without local artifact generation.",
+            path,
+            type(exc).__name__,
+            exc,
+        )
+        return None
 
 INVOICE_PREFIX = "INV-"
 DEFAULT_VAT_RATE = Decimal("18.00")
@@ -133,10 +173,16 @@ class DecimalSafeJSONResponse(JSONResponse):
 # ---------------------------------------------------------------------------
 
 
-def get_db() -> Iterator[Session]:
-    """Yield a session from ``database.get_db()``; its ``finally`` closes it."""
+def get_db(request: Request) -> Iterator[Session]:
+    """Yield a session from ``database.get_db()``; its ``finally`` closes it.
+
+    The session is also stashed on ``request.state`` so the global
+    ``Exception`` handler can perform a defensive ``rollback()`` if an
+    unhandled error escapes with a transaction still open.
+    """
 
     with _get_db_context() as session:
+        request.state._saldora_db_session = session
         yield session
 
 
@@ -424,6 +470,27 @@ class TokenResponse(BaseModel):
     user: dict[str, Any] | None = None
 
 
+def _normalize_optional_client_email(value: Any) -> Any:
+    """Validate an optional client recipient address (no CR/LF injection)."""
+
+    if value is None or not isinstance(value, str):
+        return value
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if any(character in cleaned for character in "\r\n"):
+        raise ValueError("client_email must not contain line breaks")
+    if "@" not in cleaned or "." not in cleaned:
+        raise ValueError("client_email must be a valid email address")
+    return cleaned
+
+
+# Single-source optional recipient type for outbound document delivery.
+OptionalClientEmail = Annotated[
+    str | None, BeforeValidator(_normalize_optional_client_email)
+]
+
+
 class InvoiceCreateRequest(BaseModel):
     """Payload for creating a VAT-inclusive invoice (UBL-ready)."""
 
@@ -435,6 +502,9 @@ class InvoiceCreateRequest(BaseModel):
     issue_date: date | None = Field(default=None)
     due_date: date | None = Field(default=None)
     vat_rate: float = Field(default=18.0, ge=0, le=100)
+    # Optional recipient for the post-commit outbound document email. When
+    # omitted the invoice is still created; ``email_sent`` stays false.
+    client_email: OptionalClientEmail = Field(default=None, max_length=255)
 
 
 class ApproveRequest(BaseModel):
@@ -476,6 +546,8 @@ class DeliveryNoteCreateRequest(BaseModel):
     issue_date: date | None = Field(default=None)
     signature_data: str = Field(min_length=1, description="Base64 PNG from canvas")
     invoice_id: str | None = Field(default=None, max_length=50)
+    # Optional recipient for the post-commit outbound document email.
+    client_email: OptionalClientEmail = Field(default=None, max_length=255)
 
 
 class StatsResponse(BaseModel):
@@ -528,6 +600,10 @@ class InvoiceResponse(BaseModel):
     client_address: str | None
     approved_by: str | None
     xml_file_path: str | None
+    # Post-commit outbound email outcome (always present; ``warning`` is set
+    # only when a requested dispatch could not be completed).
+    email_sent: bool = False
+    warning: str | None = None
 
 
 class DeliveryNoteResponse(BaseModel):
@@ -550,6 +626,9 @@ class DeliveryNoteResponse(BaseModel):
     documenso_recipient_email: str | None = None
     documenso_signed_at: datetime | None = None
     documenso_verification_hash: str | None = None
+    # Post-commit outbound email outcome (same contract as invoices).
+    email_sent: bool = False
+    warning: str | None = None
 
 
 class CorrectionReceipt(BaseModel):
@@ -591,11 +670,25 @@ class DocumensoSignRequest(BaseModel):
     """Optional signer address; defaults to the authenticated account email."""
 
     recipient_email: NormalizedEmail | None = Field(default=None, max_length=255)
+    # Fallback channel: when no Documenso API key is configured, the raw
+    # Base64 PNG captured on the touchscreen signature canvas is saved
+    # directly into the database (Supabase) instead of round-tripping
+    # through the external signer.
+    signature_data: str | None = Field(
+        default=None,
+        max_length=2_000_000,
+        description="Base64 PNG from the touchscreen canvas; used when Documenso is unconfigured.",
+    )
 
     @field_validator("recipient_email", mode="before")
     @classmethod
     def _empty_recipient_is_none(cls, value: Any) -> Any:
         # An empty or blank address means "sign with my own email", not a 422.
+        return value.strip() or None if isinstance(value, str) else value
+
+    @field_validator("signature_data", mode="before")
+    @classmethod
+    def _empty_signature_is_none(cls, value: Any) -> Any:
         return value.strip() or None if isinstance(value, str) else value
 
 
@@ -1022,6 +1115,89 @@ def send_email_native(
     )
 
 
+# Hard wall-clock cap for in-request email dispatch. A wedged SMTP socket or
+# a stalled mail provider must never hold a create-document request open
+# until the serverless function timeout — the document is already committed.
+EMAIL_DISPATCH_TIMEOUT_SECONDS = 15.0
+
+
+def _dispatch_email_bounded(
+    recipient_email: str,
+    subject: str,
+    body_text: str,
+    attachment_path: str | Path | None = None,
+) -> tuple[bool, str]:
+    """Run ``send_email_native`` on a daemon thread with a hard time cap.
+
+    ``send_email_native`` never raises (it reports ``(ok, message)``), but a
+    slow provider can hold its caller for the full 30s SMTP socket timeout.
+    Dispatching on a daemon thread joined with a deadline keeps the request
+    bounded: on timeout the HTTP response is released immediately and the
+    abandoned worker thread can never block process shutdown.
+    """
+
+    outcome: dict[str, tuple[bool, str]] = {}
+
+    def _run() -> None:
+        try:
+            outcome["result"] = send_email_native(
+                recipient_email, subject, body_text, None, attachment_path
+            )
+        except Exception as exc:  # noqa: BLE001 - isolated per the mail contract
+            outcome["result"] = (False, f"{type(exc).__name__}: {exc}")
+
+    worker = threading.Thread(target=_run, name="saldora-mail-dispatch", daemon=True)
+    worker.start()
+    worker.join(timeout=EMAIL_DISPATCH_TIMEOUT_SECONDS)
+
+    if worker.is_alive():
+        logger.warning(
+            "Email dispatch to %s exceeded %.0fs; releasing the request.",
+            recipient_email,
+            EMAIL_DISPATCH_TIMEOUT_SECONDS,
+        )
+        return (
+            False,
+            f"Email dispatch timed out after {int(EMAIL_DISPATCH_TIMEOUT_SECONDS)} seconds",
+        )
+    return outcome.get("result", (False, "Email dispatcher produced no result"))
+
+
+def _post_commit_email_dispatch(
+    client_email: str | None,
+    subject: str,
+    body_text: str,
+    attachment_path: str | Path | None = None,
+) -> tuple[bool, str | None]:
+    """Best-effort outbound mail, executed ONLY after ``db.commit()``.
+
+    Returns ``(email_sent, warning)``. Any failure is fully isolated: the
+    document is already durably stored, so an email problem can only ever
+    downgrade the response payload (``email_sent=false`` + ``warning``),
+    never the HTTP 201 itself.
+    """
+
+    if not client_email:
+        return False, None
+
+    try:
+        ok, message = _dispatch_email_bounded(
+            client_email, subject, body_text, attachment_path
+        )
+        if ok:
+            logger.info("Post-commit email dispatched to %s.", client_email)
+            return True, None
+        logger.warning(
+            "Post-commit email dispatch to %s failed: %s", client_email, message
+        )
+        return False, message
+    except Exception as mail_err:  # noqa: BLE001 - mail must never fail the document
+        logger.warning(
+            "Post-commit email dispatch to %s raised: %s", client_email, mail_err
+        )
+        return False, str(mail_err)
+
+
 # ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
@@ -1086,19 +1262,28 @@ async def unhandled_exception_handler(
     """Last-resort guardrail: unexpected server errors must never surface as
     raw HTML/plain-text pages that crash the SPA with ``Unexpected token '<'``.
 
-    Every unhandled exception is logged with its stack trace and returned as a
-    JSON 500 with a stable shape (``detail`` + ``message``). Request-scoped
-    database sessions are closed (and thus their transactions released) by the
-    ``get_db`` dependency teardown; endpoints that hold a session wrap their
-    own bodies with ``db.rollback()`` for Supabase connection-lock hygiene.
+    Every unhandled exception is logged with its stack trace and returned as
+    a JSON 500 with a stable shape (``detail`` + ``message``). If a request-
+    scoped database session is still bound to an open transaction it is
+    rolled back first (``database.get_db`` also rolls back on teardown, so
+    Supabase connection locks are always released either way).
     """
+
+    # Defensive rollback: release any transaction still open on a session
+    # that reached the dependency teardown with the exception in flight.
+    try:
+        session = getattr(request.state, "_saldora_db_session", None)
+        if session is not None:
+            session.rollback()
+    except Exception:  # noqa: BLE001 - the shield must never raise
+        logger.debug("Rollback during global error handling was a no-op.")
 
     logger.exception(
         "Unhandled server error on %s %s", request.method, request.url.path
     )
     return JSONResponse(
         status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detail": str(exc), "message": "Failed to process request"},
+        content={"detail": str(exc), "message": "Internal server error"},
     )
 
 
@@ -1704,7 +1889,7 @@ def create_invoice(
         logger.exception("Invoice creation failed unexpectedly")
         return JSONResponse(
             status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"detail": str(exc), "message": "Failed to process request"},
+            content={"detail": str(exc), "message": "Internal server error"},
         )
 
 
@@ -1738,7 +1923,41 @@ def _create_invoice_impl(
             .first()
         )
         if registered is None:
-            logger.info("Invoice will reference a newly seen client tax id.")
+            # Supabase (PostgreSQL) ENFORCES invoices.client_tax_id ->
+            # clients.tax_id. SQLite-based unit tests never caught the
+            # mismatch because SQLite ships with foreign-key enforcement
+            # off, so every FIRST invoice for a new client EDB failed on
+            # production with ForeignKeyViolation (surfacing as a
+            # misleading 409). Register the client first — in its own
+            # committed transaction, outside the invoice retry loop — so
+            # the foreign key always resolves.
+            logger.info("Registering newly seen client tax id %s.", client_tax_id)
+            new_client = Client(
+                user_id=current_user.id,
+                tax_id=client_tax_id,
+                name=client_name,
+                email="",
+                phone="",
+            )
+            db.add(new_client)
+            try:
+                db.commit()
+            except IntegrityError:
+                # A concurrent writer may have registered the same EDB
+                # (clients.tax_id is globally unique). Adopt whichever row
+                # exists — the foreign key only needs the tax id to exist.
+                db.rollback()
+                adopt = (
+                    db.query(Client).filter(Client.tax_id == client_tax_id).first()
+                )
+                if adopt is None:
+                    logger.exception(
+                        "Client registration failed for tax id %s.", client_tax_id
+                    )
+                    raise HTTPException(
+                        status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="Could not register the client record.",
+                    ) from None
 
     invoice: Invoice | None = None
 
@@ -1789,19 +2008,48 @@ def _create_invoice_impl(
                 detail="Could not create invoice.",
             ) from exc
 
-        # Generate and persist UBL XML
-        try:
-            XML_DIR.mkdir(parents=True, exist_ok=True)
-            xml_content = _generate_ubl_xml(invoice)
-            xml_path = XML_DIR / f"{code}.xml"
-            xml_path.write_text(xml_content, encoding="utf-8")
-            invoice.xml_file_path = str(xml_path)
-            db.commit()
-            db.refresh(invoice)
-        except Exception:  # noqa: BLE001
-            logger.exception("UBL XML generation failed for %s; continuing without XML.", code)
+        # Generate and persist UBL XML (best-effort audit copy; the invoice
+        # itself is already durably committed, so an artifact failure — e.g.
+        # a read-only deployment filesystem — must never fail the request).
+        writable_xml_dir = _ensure_writable_dir(XML_DIR)
+        if writable_xml_dir is not None:
+            try:
+                xml_content = _generate_ubl_xml(invoice)
+                xml_path = writable_xml_dir / f"{code}.xml"
+                xml_path.write_text(xml_content, encoding="utf-8")
+                invoice.xml_file_path = str(xml_path)
+                db.commit()
+                db.refresh(invoice)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "UBL XML generation failed for %s; continuing without XML.", code
+                )
 
-        return _serialize_invoice(invoice)
+        # OUTBOUND MAIL DISPATCH — executed ONLY AFTER db.commit() succeeded,
+        # fully isolated so a mail problem can never fail the stored document.
+        email_sent, mail_warning = False, None
+        if payload.client_email:
+            attachment = (
+                invoice.xml_file_path
+                if invoice.xml_file_path and Path(invoice.xml_file_path).is_file()
+                else None
+            )
+            email_sent, mail_warning = _post_commit_email_dispatch(
+                payload.client_email,
+                f"Нова фактура {code} - Saldora",
+                (
+                    f"Почитувани {client_name},\n\n"
+                    f"Фактурата {code} беше издадена на износ "
+                    f"{float(total):,.2f} МКД (со вклучен ДДВ).\n\n"
+                    f"Со почит,\nSaldora B2B Систем"
+                ),
+                attachment,
+            )
+
+        serialized = _serialize_invoice(invoice)
+        serialized["email_sent"] = email_sent
+        serialized["warning"] = mail_warning
+        return serialized
 
     # The loop either returns or raises; this is only a static-analysis guard.
     raise HTTPException(
@@ -2052,7 +2300,7 @@ def create_delivery_note(
         logger.exception("Delivery-note creation failed unexpectedly")
         return JSONResponse(
             status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"detail": str(exc), "message": "Failed to process request"},
+            content={"detail": str(exc), "message": "Internal server error"},
         )
 
 
@@ -2071,6 +2319,22 @@ def _create_delivery_note_impl(
 
     issue = payload.issue_date or datetime.utcnow().date()
     collision: IntegrityError | None = None
+
+    # Supabase enforces delivery_notes.invoice_id -> invoices.id. A dangling
+    # reference would fail with ForeignKeyViolation and burn every retry
+    # attempt, so validate it up-front and answer with a clean JSON 404.
+    if payload.invoice_id:
+        referenced_invoice = _find_invoice(
+            db, payload.invoice_id, user_id=current_user.id
+        )
+        if referenced_invoice is None:
+            raise HTTPException(
+                status_code=http_status.HTTP_404_NOT_FOUND,
+                detail=(
+                    f"Referenced invoice '{payload.invoice_id}' was not found "
+                    "for this account."
+                ),
+            )
 
     for attempt in range(1, MAX_CODE_ALLOCATION_ATTEMPTS + 1):
         note_code = _next_delivery_note_code(db)
@@ -2109,7 +2373,27 @@ def _create_delivery_note_impl(
             ) from exc
 
         logger.info("e-Ispratnica %s filed to UJP (simulated).", note_code)
-        return _serialize_delivery_note(note)
+
+        # OUTBOUND MAIL DISPATCH — executed ONLY AFTER db.commit() succeeded,
+        # fully isolated so a mail problem can never fail the stored document.
+        email_sent, mail_warning = False, None
+        if payload.client_email:
+            email_sent, mail_warning = _post_commit_email_dispatch(
+                payload.client_email,
+                f"еИспратница {note_code} - Saldora",
+                (
+                    f"Почитувани {payload.client_name},\n\n"
+                    f"еИспратницата {note_code} беше евидентирана.\n"
+                    f"Предмет: {payload.items_description}\n"
+                    f"Адреса на испорака: {payload.delivery_address}\n\n"
+                    f"Со почит,\nSaldora B2B Систем"
+                ),
+            )
+
+        serialized = _serialize_delivery_note(note)
+        serialized["email_sent"] = email_sent
+        serialized["warning"] = mail_warning
+        return serialized
 
     logger.exception(
         "Could not persist delivery note after %d attempt(s)",
@@ -2208,6 +2492,45 @@ def sign_delivery_note_documenso(
     )
     title = f"е-Испратница {note.code} — {note.client_name or note.recipient_name}"
 
+    # Graceful degradation: without a Documenso API key (neither the
+    # per-account setting nor the DOCUMENSO_API_KEY environment variable),
+    # the touchscreen canvas signature is saved directly into Supabase
+    # instead of failing hard. The document stays legally signed and the
+    # client receives a clean, machine-readable outcome.
+    api_key = _load_documenso_api_key(db, current_user)
+    if not is_configured_api_key(api_key):
+        fallback_signature = payload.signature_data if payload else None
+        if fallback_signature:
+            note.signature_data = fallback_signature
+            note.is_signed = True
+            note.signed_at = datetime.utcnow()
+            note.documenso_status = "NOT_SENT"
+            try:
+                db.commit()
+                db.refresh(note)
+            except SQLAlchemyError as exc:
+                db.rollback()
+                logger.exception(
+                    "Fallback canvas-signature persistence failed for %s", note.code
+                )
+                raise HTTPException(
+                    status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Не успеа зачувувањето на потписот.",
+                ) from exc
+            logger.info(
+                "Documenso unconfigured for %s; canvas signature saved directly "
+                "to the database.",
+                note.code,
+            )
+            return {"signing_url": "", "doc_id": "", "status": "SAVED_LOCALLY"}
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Documenso не е конфигуриран. Поставете DOCUMENSO_API_KEY или "
+                "зачувајте го потписот директно преку полотното платно."
+            ),
+        )
+
     try:
         pdf_bytes = build_delivery_note_pdf(note)
     except Exception as exc:  # pragma: no cover - depends on local font stack
@@ -2219,7 +2542,6 @@ def sign_delivery_note_documenso(
 
     client: DocumensoClient | None = None
     try:
-        api_key = _load_documenso_api_key(db, current_user)
         client = DocumensoClient(
             api_key=api_key,
             base_url=current_user.documenso_base_url,

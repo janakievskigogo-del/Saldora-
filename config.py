@@ -7,7 +7,9 @@ deployment to use the same services with injected configuration.
 
 from __future__ import annotations
 
+import logging
 import os
+import tempfile
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
@@ -19,8 +21,35 @@ from dotenv import load_dotenv
 from legacy_models import Channel, Language
 from utils import normalize_channel, normalize_language_code, parse_decimal
 
+logger = logging.getLogger(__name__)
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
+
+
+def is_vercel_runtime() -> bool:
+    """True when running inside a Vercel serverless (lambda) function.
+
+    Vercel sets ``VERCEL=1`` (and ``VERCEL_ENV``) in every deployment.  The
+    deployment bundle is mounted **read-only** there; only ``/tmp`` is
+    writable, so any artifact generation must be redirected.
+    """
+
+    return bool(os.getenv("VERCEL") or os.getenv("VERCEL_ENV"))
+
+
+def resolve_writable_dir(bundle_default: Path) -> Path:
+    """Return a writable directory for generated artifacts.
+
+    Vercel-aware path resolver (see the deployment guardrail): on Vercel the
+    bundle filesystem is read-only, so ``output/`` is relocated to a
+    sandboxed subdirectory of the OS temp dir.  Locally the project-level
+    directory is kept unchanged.
+    """
+
+    if is_vercel_runtime():
+        return Path(tempfile.gettempdir()) / "saldora-output"
+    return bundle_default
 
 # Groq's OpenAI-compatible API endpoint.  Both the reminder agent and the
 # invoice parser use the OpenAI SDK pointed at this base URL.
@@ -291,9 +320,13 @@ class Settings:
 
         With the standard ``DATA_DIR=data`` layout this resolves to the
         project-level ``output/`` directory, so a file is created at
-        ``output/NPL-2026-0001.xml``.
+        ``output/NPL-2026-0001.xml``.  On Vercel (read-only bundle
+        filesystem) it resolves to ``/tmp/saldora-output`` instead, so the
+        write can never raise ``OSError: [Errno 30] Read-only file system``.
         """
 
+        if is_vercel_runtime():
+            return Path(tempfile.gettempdir()) / "saldora-output"
         return self.data_dir.parent / "output"
 
     @property
@@ -321,10 +354,25 @@ class Settings:
         return datetime.now(ZoneInfo(self.timezone)).date()
 
     def ensure_directories(self) -> None:
-        """Create the local data directories used by the MVP."""
+        """Create the local data directories used by the MVP.
 
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.ubl_output_dir.mkdir(parents=True, exist_ok=True)
+        Directory creation must never take the process down: on a read-only
+        deployment filesystem (Vercel/lambda) ``mkdir`` raises
+        ``OSError``/``PermissionError``, which is logged and swallowed so
+        callers degrade to in-memory/stream behavior instead of crashing.
+        """
+
+        for directory in (self.data_dir, self.ubl_output_dir):
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                logger.error(
+                    "Could not create directory %s (%s: %s); continuing "
+                    "without a writable local directory.",
+                    directory,
+                    type(exc).__name__,
+                    exc,
+                )
 
 
 def load_settings(env_file: Path | str | None = None) -> Settings:

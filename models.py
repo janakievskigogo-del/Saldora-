@@ -8,6 +8,7 @@ PII fields (name, email, phone, recipient names) use `EncryptedString` (Fernet a
 from __future__ import annotations
 
 import enum
+import logging
 import os
 from datetime import date, datetime
 from decimal import Decimal
@@ -64,8 +65,25 @@ def _resolve_cipher() -> Fernet:
             )
     else:
         key_material = Fernet.generate_key()
-        _DB_KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _DB_KEY_PATH.write_bytes(key_material + b"\n")
+        try:
+            _DB_KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _DB_KEY_PATH.write_bytes(key_material + b"\n")
+        except OSError as exc:
+            # Read-only deployment filesystem (Vercel/lambda): the generated
+            # key cannot be persisted.  Use an ephemeral in-process key so
+            # the request still succeeds; previously encrypted values that
+            # cannot be decrypted fall back to plaintext passthrough in
+            # ``process_result_value``.  Set DB_ENCRYPTION_KEY in the
+            # environment to keep data stable across cold starts.
+            logging.getLogger(__name__).warning(
+                "Could not persist %s (%s: %s). Using an ephemeral "
+                "encryption key for this process instance; set the "
+                "%s environment variable on read-only deployments.",
+                _DB_KEY_PATH,
+                type(exc).__name__,
+                exc,
+                _DB_KEY_ENV,
+            )
 
     try:
         _FERNET = Fernet(key_material)
