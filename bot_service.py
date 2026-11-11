@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 import smtplib
 import sys
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -12,6 +14,7 @@ from email.utils import formataddr
 from pathlib import Path
 
 from dotenv import load_dotenv
+from sqlalchemy.exc import IntegrityError
 
 from database import SessionLocal, init_db
 from models import DeliveryNote, Invoice
@@ -273,6 +276,27 @@ async def ispratnica(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         db.close()
 
 
+def _generate_unique_invoice_code(db) -> str:
+    """Fail-safe, timestamped invoice code: ``INV-{YYYYMMDD}-{HEX6}``.
+
+    Mirrors ``api.generate_guaranteed_unique_code`` (kept standalone here so
+    the Telegram bot never imports the FastAPI app): UTC date bucket plus a
+    6-character random hex body, verified against the database before use.
+    """
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    for _ in range(50):
+        candidate = f"INV-{stamp}-{secrets.token_hex(3).upper()}"
+        if (
+            db.query(Invoice.id)
+            .filter((Invoice.code == candidate) | (Invoice.id == candidate))
+            .first()
+            is None
+        ):
+            return candidate
+    raise RuntimeError("Could not allocate a unique invoice code.")
+
+
 async def new_invoice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(context.args) < 3:
         await update.message.reply_text(
@@ -293,19 +317,31 @@ async def new_invoice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     db = SessionLocal()
     try:
-        count = db.query(Invoice).count() + 1
-        new_code = f"NPL-2026-{count:04d}"
+        # Fail-safe allocation + IntegrityError backstop: the timestamped hex
+        # code is verified against the DB, and a racing writer can still only
+        # lose its commit, never produce a duplicate.
+        new_code = _generate_unique_invoice_code(db)
 
-        new_inv = Invoice(
-            id=new_code,
-            code=new_code,
-            client_name=client_name,
-            amount=amount,
-            description=description,
-            status="UNPAID",
-        )
+        def _build(code: str) -> Invoice:
+            return Invoice(
+                id=code,
+                code=code,
+                client_name=client_name,
+                amount=amount,
+                description=description,
+                status="UNPAID",
+            )
+
+        new_inv = _build(new_code)
         db.add(new_inv)
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            new_code = _generate_unique_invoice_code(db)
+            new_inv = _build(new_code)
+            db.add(new_inv)
+            db.commit()
 
         text = (
             f"<b>Успешно запишана нова фактура во база:</b>\n"

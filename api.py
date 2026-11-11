@@ -27,7 +27,7 @@ import os
 import re
 import secrets
 import string
-from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
@@ -89,7 +89,7 @@ STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
 XML_DIR = BASE_DIR / "data" / "xmls"
 
-INVOICE_PREFIX = "NPL-2026-"
+INVOICE_PREFIX = "INV-"
 DEFAULT_VAT_RATE = Decimal("18.00")
 CENT = Decimal("0.01")
 ALLOWED_STATUSES = {"UNPAID", "PAID", "STORNO"}
@@ -732,21 +732,6 @@ def _require_owned_invoice(db: Session, code: str, user_id: int) -> Invoice:
 # ---------------------------------------------------------------------------
 
 
-def _max_numeric_suffix(values: Iterable[str | None], prefix: str) -> int:
-    """Highest ``<prefix><digits>`` suffix across ``values`` (0 when none)."""
-
-    highest = 0
-    for candidate in values:
-        if candidate and candidate.startswith(prefix):
-            suffix = candidate[len(prefix) :]
-            if suffix.isdigit():
-                highest = max(highest, int(suffix))
-    return highest
-
-
-_CODE_SUFFIX_ALPHABET = string.digits + string.ascii_uppercase
-
-
 def _code_exists(db: Session, model: type, code: str) -> bool:
     """True when ``code`` is already used by ``model``.
 
@@ -776,75 +761,53 @@ def generate_guaranteed_unique_code(
     model: type,
     prefix: str,
     *,
-    year: int | None = None,
+    now: datetime | None = None,
 ) -> str:
-    """Allocate a guaranteed-unique ``{prefix}-{YEAR}-{NNNN}`` business code.
+    """Allocate a fail-safe, timestamped code: ``{prefix}-{YYYYMMDD}-{HEX6}``.
 
-    1. Scans every stored code matching ``{prefix}-{YEAR}-%`` (for invoices
-       also their mirrored ``id`` PK) and takes the highest integer suffix —
-       never a blind increment.
-    2. Increments it and verifies the candidate with an explicit existence
-       query (``model.code == candidate``), rolling the sequence forward past
-       any collision.
-    3. If the sequential block is somehow blocked, appends a random
-       4-character uppercase alphanumeric suffix (``ISP-2026-0001-B3X1``)
-       which is 100% unique under high concurrency; both stages are bounded
-       and raise ``RuntimeError`` instead of hanging when the uniqueness
-       oracle itself is broken.
+    Design goals on Supabase/Vercel (stateless, concurrent, no shared counters):
+
+    1. **Timestamped** — the UTC date bucket (``YYYYMMDD``) keeps codes
+       chronologically sortable and distributes the random space per day.
+    2. **Random** — a 6-character uppercase hex body (``secrets.token_hex(3)``,
+       16.7M combinations per day) makes coincidental collisions practically
+       impossible without any cross-instance sequence state.
+    3. **Verified** — every candidate is checked against the database
+       (``model.code == candidate`` and, for invoices, the mirrored ``id``
+       primary key) before it is handed out; on collision a fresh hex is
+       generated immediately.
+    4. **Bounded** — 50 regeneration attempts; a same-day collision odds-wise
+       cannot exhaust that, so exceeding it means the uniqueness oracle itself
+       is broken and must surface as a hard error, not a hang.
+
+    The endpoint-level ``IntegrityError -> rollback -> regenerate -> recommit``
+    retry loops remain as the final backstop against true race conditions.
     """
 
-    year_part = year if year is not None else date.today().year
-    scope_prefix = f"{prefix}-{year_part}-"
-
-    existing: list[str | None] = [
-        row[0]
-        for row in db.query(model.code)
-        .filter(model.code.like(f"{scope_prefix}%"))
-        .all()
-    ]
-    if model is Invoice:
-        existing += [
-            row[0]
-            for row in db.query(Invoice.id)
-            .filter(Invoice.id.like(f"{scope_prefix}%"))
-            .all()
-        ]
-    sequence = _max_numeric_suffix(existing, scope_prefix)
-
-    # Roll the sequence forward past any explicit collision.
-    for _ in range(100):
-        candidate = f"{scope_prefix}{sequence + 1:04d}"
-        if not _code_exists(db, model, candidate):
-            return candidate
-        sequence += 1
-
-    # Deterministic allocation failed: a random 4-char alphanumeric suffix
-    # (36^4 = 1.68M combinations) guarantees uniqueness under concurrency.
-    for _ in range(25):
-        suffix = "".join(
-            secrets.choice(_CODE_SUFFIX_ALPHABET) for _ in range(4)
-        )
-        candidate = f"{scope_prefix}{sequence + 1:04d}-{suffix}"
+    stamp = (now or datetime.now(timezone.utc)).strftime("%Y%m%d")
+    for _ in range(50):
+        hex6 = secrets.token_hex(3).upper()
+        candidate = f"{prefix}-{stamp}-{hex6}"
         if not _code_exists(db, model, candidate):
             return candidate
 
     raise RuntimeError(
-        f"Could not allocate a unique {prefix} code after sequential and "
-        "random-suffix allocation attempts."
+        f"Could not allocate a unique {prefix} code after "
+        "50 timestamped-hex regeneration attempts."
     )
 
 
 def _next_invoice_code(db: Session) -> str:
-    """Allocate the next unique e-Faktura (invoice) code."""
+    """Allocate the next fail-safe e-Faktura (invoice) code, e.g. ``INV-20261111-8A3F9E``."""
 
-    return generate_guaranteed_unique_code(db, Invoice, "NPL")
+    return generate_guaranteed_unique_code(db, Invoice, "INV")
 
 
-DELIVERY_NOTE_PREFIX = "ISP-2026-"
+DELIVERY_NOTE_PREFIX = "ISP-"
 
 
 def _next_delivery_note_code(db: Session) -> str:
-    """Allocate the next unique e-Ispratnica (delivery note) code."""
+    """Allocate the next fail-safe e-Ispratnica code, e.g. ``ISP-20261111-9B2C4D``."""
 
     return generate_guaranteed_unique_code(db, DeliveryNote, "ISP")
 
