@@ -5365,7 +5365,7 @@
         });
         const data = await res.json();
         if (!res.ok || data.success === false) {
-          throw new Error(data.message || 'Грешка при испраќање на е-пошта');
+          throw new Error(data.detail || data.message || 'Грешка при испраќање на е-пошта');
         }
         closeModal('remindModal');
         showToast(`Потсетникот за ${code} е испратен на ${email}`, 'success');

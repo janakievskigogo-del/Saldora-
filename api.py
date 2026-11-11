@@ -20,6 +20,7 @@ Defensive notes
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import html as html_module
 import json
@@ -518,19 +519,26 @@ class StornoRequest(BaseModel):
 
 
 class RemindRequest(BaseModel):
-    """Destination address for an SMTP payment reminder."""
+    """Optional recipient override for a payment reminder.
 
-    recipient_email: str = Field(min_length=3, max_length=255)
+    When ``recipient_email`` is omitted the endpoint falls back to the email
+    registered on the invoice's client record, and answers 400 when neither is
+    available.
+    """
+
+    recipient_email: str | None = Field(default=None, max_length=255)
 
     @field_validator("recipient_email")
     @classmethod
-    def _reject_header_injection(cls, value: str) -> str:
+    def _reject_header_injection(cls, value: str | None) -> str | None:
         """Strip the address and refuse CR/LF header injection attempts."""
 
+        if value is None:
+            return None
         cleaned = value.strip()
         if any(character in cleaned for character in "\r\n"):
             raise ValueError("recipient_email must not contain line breaks")
-        return cleaned
+        return cleaned or None
 
 
 class SignRequest(BaseModel):
@@ -654,7 +662,8 @@ class StornoResponse(BaseModel):
 
 
 class RemindResponse(BaseModel):
-    success: bool
+    success: bool = True
+    status: str = "success"
     message: str
 
 
@@ -818,6 +827,34 @@ def _require_owned_invoice(db: Session, code: str, user_id: int) -> Invoice:
             detail="Немате дозвола да го менувате овој документ.",
         )
     return invoice
+
+
+def _is_valid_recipient_email(value: str | None) -> bool:
+    """Conservative structural check for an outbound reminder address."""
+
+    candidate = str(value or "").strip()
+    if not candidate or any(character in candidate for character in "\r\n"):
+        return False
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", candidate))
+
+
+def _invoice_customer_email(invoice: Invoice) -> str | None:
+    """Return the invoice's registered client email, or ``None`` when absent.
+
+    The customer address lives on the ``Client`` row linked through
+    ``invoices.client_tax_id`` (``Invoice`` has no ``customer_email`` column),
+    so an unregistered or email-less client correctly yields ``None`` and the
+    reminder route answers with the "no email on file" JSON 400.
+    """
+
+    try:
+        client = invoice.client
+    except SQLAlchemyError:  # pragma: no cover - defensive lazy-load failure
+        logger.warning("Could not resolve the client email for invoice %s.", invoice.id)
+        return None
+    email = getattr(client, "email", None) if client is not None else None
+    cleaned = str(email or "").strip()
+    return cleaned or None
 
 
 # ---------------------------------------------------------------------------
@@ -1099,7 +1136,7 @@ def send_email_native(
     extra_headers: Mapping[str, str] | None = None,
     attachment_path: str | Path | None = None,
     html_body: str | None = None,
-) -> tuple[bool, str]:
+) -> tuple[bool, str | None]:
     """Lazy proxy to ``bot_service.send_email_native``.
 
     The proxy keeps ``api.py`` importable even when Telegram/SMTP optional
@@ -1126,22 +1163,23 @@ def _dispatch_email_bounded(
     subject: str,
     body_text: str,
     attachment_path: str | Path | None = None,
-) -> tuple[bool, str]:
+    html_body: str | None = None,
+) -> tuple[bool, str | None]:
     """Run ``send_email_native`` on a daemon thread with a hard time cap.
 
-    ``send_email_native`` never raises (it reports ``(ok, message)``), but a
-    slow provider can hold its caller for the full 30s SMTP socket timeout.
+    ``send_email_native`` reports ``(ok, message)`` instead of raising, but a
+    slow provider can hold its caller for the full SMTP socket timeout.
     Dispatching on a daemon thread joined with a deadline keeps the request
     bounded: on timeout the HTTP response is released immediately and the
     abandoned worker thread can never block process shutdown.
     """
 
-    outcome: dict[str, tuple[bool, str]] = {}
+    outcome: dict[str, tuple[bool, str | None]] = {}
 
     def _run() -> None:
         try:
             outcome["result"] = send_email_native(
-                recipient_email, subject, body_text, None, attachment_path
+                recipient_email, subject, body_text, None, attachment_path, html_body
             )
         except Exception as exc:  # noqa: BLE001 - isolated per the mail contract
             outcome["result"] = (False, f"{type(exc).__name__}: {exc}")
@@ -1447,20 +1485,6 @@ def _otp_email_html(email: str, code: str, minutes: int) -> str:
 </body></html>"""
 
 
-def _send_signup_otp_email(recipient: str, subject: str, body_text: str, html_body: str) -> None:
-    """Background-task worker for signup OTP delivery.
-
-    ``send_email_native`` never raises, so a provider outage only logs here —
-    the client already received an instant response.
-    """
-
-    ok, message = send_email_native(recipient, subject, body_text, html_body=html_body)
-    if not ok:
-        logger.error("OTP email dispatch to %s failed: %s", recipient, message)
-    else:
-        logger.info("Signup OTP dispatched to %s.", recipient)
-
-
 @app.post("/api/signup/request-otp")
 def request_signup_otp(
     payload: SignupOTPRequest,
@@ -1472,8 +1496,12 @@ def request_signup_otp(
     The wizard includes ``password`` and ``password_confirm`` so an invalid
     password is rejected before an OTP email is sent. API clients that omit the
     password still receive a code; the final ``complete`` call always enforces
-    the policy again. The email itself is dispatched via ``BackgroundTasks`` so
-    the endpoint responds instantly without blocking on the mail provider.
+    the policy again.
+
+    The code and its expiry are committed BEFORE the provider is contacted, and
+    the dispatch result is checked, so a transport outage becomes a JSON 502
+    instead of a false success. ``background_tasks`` is retained in the
+    signature for backwards compatibility with existing callers.
     """
 
     if payload.password is not None:
@@ -1507,14 +1535,28 @@ def request_signup_otp(
         f"Кодот е валиден 5 минути и може да се искористи само еднаш.\n"
         f"Ако вие не побаравте сметка, игнорирајте ја пораката.\n\nSaldora"
     )
-    background_tasks.add_task(
-        _send_signup_otp_email,
+
+    # The OTP row is already durable; a failed dispatch must be reported to the
+    # wizard (never masked as a successful send) so the user can retry.
+    success, error_message = send_email_native(
         email,
         subject,
         body_text,
-        _otp_email_html(email, code, OTP_TTL_SECONDS // 60),
+        html_body=_otp_email_html(email, code, OTP_TTL_SECONDS // 60),
     )
-    return {"status": "sent", "expires_in_seconds": OTP_TTL_SECONDS}
+    if not success:
+        logger.error("OTP email dispatch to %s failed: %s", email, error_message)
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail=f"Email delivery failed: {error_message or 'unknown error'}",
+        )
+
+    logger.info("Signup OTP dispatched to %s.", email)
+    return {
+        "status": "success",
+        "message": "Verification code sent",
+        "expires_in_seconds": OTP_TTL_SECONDS,
+    }
 
 
 @app.post("/api/signup/verify-otp")
@@ -2157,23 +2199,105 @@ async def remind_invoice(
     db: DbSession,
     current_user: CurrentUser,
 ) -> dict[str, Any] | JSONResponse:
-    """Send a real payment reminder for an invoice (non-blocking dispatch)."""
+    """Send a payment reminder and report the real delivery outcome.
+
+    The recipient is the explicit ``recipient_email`` when the dashboard
+    supplies one, otherwise the invoice's registered client address. An invoice
+    with no usable address is rejected with a JSON 400 rather than a reminder
+    that silently goes nowhere, and a transport failure is a JSON 502 so the UI
+    can show the provider's reason. ``background_tasks`` is retained in the
+    signature for backwards compatibility; delivery is awaited so its result
+    can be checked.
+    """
 
     invoice = _require_owned_invoice(db, code, current_user.id)
 
-    recipient = payload.recipient_email.strip()
+    recipient = (payload.recipient_email or "").strip() if payload else ""
+    if not recipient:
+        recipient = _invoice_customer_email(invoice) or ""
+    if not recipient:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail="Клиентот нема внесено е-пошта за потсетник.",
+        )
+    if not _is_valid_recipient_email(recipient):
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail="Клиентот нема внесено валидна е-пошта за потсетник.",
+        )
+
     invoice_code = invoice.code or invoice.id
     client_name = invoice.client_name or "Клиент"
     amount = _to_float(invoice.total_amount or invoice.amount) or 0.0
+    amount_text = f"{amount:,.2f} МКД"
+    due_date = invoice.due_date.strftime("%d.%m.%Y") if invoice.due_date else "не е наведен"
+
+    bank_name = (os.getenv("BUSINESS_BANK_NAME") or "").strip()
+    bank_account = (
+        os.getenv("BUSINESS_BANK_ACCOUNT") or os.getenv("BANK_ACCOUNT") or ""
+    ).strip()
+    if bank_name or bank_account:
+        payment_lines = [
+            line
+            for line in (
+                f"• Банка: {bank_name}" if bank_name else "",
+                f"• Сметка: {bank_account}" if bank_account else "",
+            )
+            if line
+        ]
+    else:
+        payment_lines = [
+            "• Уплатата извршете ја на сметката наведена во фактурата, "
+            f"со повикување на бројот {invoice_code}."
+        ]
 
     subject = f"Потсетник за неплатена фактура {invoice_code} - Saldora"
     body = (
         f"Почитувани {client_name},\n\n"
-        f"Ве известуваме дека фактурата {invoice_code} на износ "
-        f"{amount:,.2f} МКД е со задоцнета наплата.\n"
-        f"Ве молиме извршете ја уплатата во најкраток можен рок.\n\n"
-        f"Со почит,\nSaldora B2B Систем"
+        f"Ве потсетуваме дека фактурата {invoice_code} на износ {amount_text} "
+        f"е со рок на плаќање {due_date} и сè уште не е евидентирана како платена.\n\n"
+        f"Детали за плаќање:\n"
+        f"• Фактура: {invoice_code}\n"
+        f"• Износ: {amount_text}\n"
+        f"• Рок на плаќање: {due_date}\n"
+        + "\n".join(payment_lines)
+        + "\n\nДоколку уплатата е веќе извршена, ве молиме игнорирајте ја оваа порака.\n\n"
+        "Со почит,\nSaldora B2B Систем"
     )
+
+    safe_client = html_module.escape(client_name)
+    safe_code = html_module.escape(invoice_code)
+    safe_amount = html_module.escape(amount_text)
+    safe_due = html_module.escape(due_date)
+    instructions_html = "<br>".join(html_module.escape(line) for line in payment_lines)
+    html_body = f"""<!DOCTYPE html>
+<html><body style="margin:0;padding:0;background-color:#121212;font-family:'Segoe UI',Arial,sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#121212;padding:32px 16px;">
+    <tr><td align="center">
+      <table role="presentation" width="100%" style="max-width:520px;background-color:#2D2E2B;border:1px solid #50605A;border-radius:16px;padding:36px;">
+        <tr><td style="font-size:18px;font-weight:700;letter-spacing:0.08em;color:#B9CABE;">SALDORA</td></tr>
+        <tr><td style="padding-top:14px;border-top:1px solid #50605A;font-size:16px;font-weight:600;color:#10B981;">Потсетник за плаќање</td></tr>
+        <tr><td style="padding-top:14px;font-size:14px;line-height:1.6;color:#B9CABE;">
+          Почитувани {safe_client},<br><br>
+          Ве потсетуваме дека фактурата <strong>{safe_code}</strong> на износ
+          <strong>{safe_amount}</strong> е со рок на плаќање <strong>{safe_due}</strong>
+          и сè уште не е евидентирана како платена.
+        </td></tr>
+        <tr><td style="padding-top:18px;font-size:14px;line-height:1.7;color:#B9CABE;">
+          <strong>Детали за плаќање:</strong><br>
+          • Фактура: {safe_code}<br>
+          • Износ: {safe_amount}<br>
+          • Рок на плаќање: {safe_due}<br>
+          {instructions_html}
+        </td></tr>
+        <tr><td style="padding-top:18px;font-size:12px;line-height:1.6;color:#81938A;">
+          Доколку уплатата е веќе извршена, ве молиме игнорирајте ја оваа порака.<br><br>
+          Со почит,<br>Saldora B2B Систем
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>"""
 
     # Determine XML attachment if available
     attachment_file: str | None = None
@@ -2182,23 +2306,36 @@ async def remind_invoice(
     elif (XML_DIR / f"{invoice_code}.xml").is_file():
         attachment_file = str(XML_DIR / f"{invoice_code}.xml")
 
-    # End the read transaction before the background delivery task runs, so a
-    # slow mail server cannot hold a SQLite lock and stall invoice writes.
+    # End the read transaction before delivery, so a slow mail server cannot
+    # hold a SQLite lock and stall invoice writes.
     db.rollback()
 
-    # Deliver via a FastAPI background task (Starlette runs the sync sender in
-    # the threadpool): the client gets an instant response, and delivery
-    # failures are logged instead of blocking the request.
-    background_tasks.add_task(
-        send_email_native,
+    success, error_message = await asyncio.to_thread(
+        _dispatch_email_bounded,
         recipient,
         subject,
         body,
-        None,
         attachment_file,
+        html_body=html_body,
     )
+    if not success:
+        logger.error(
+            "Payment reminder for %s to %s failed: %s",
+            invoice_code,
+            recipient,
+            error_message,
+        )
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail=f"Email delivery failed: {error_message or 'unknown error'}",
+        )
 
-    return {"success": True, "message": f"Email sent to {recipient}"}
+    logger.info("Payment reminder for %s dispatched to %s.", invoice_code, recipient)
+    return {
+        "success": True,
+        "status": "success",
+        "message": "Reminder sent successfully",
+    }
 
 
 @app.get("/api/invoices/{code}/xml")

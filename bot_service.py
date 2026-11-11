@@ -60,33 +60,81 @@ if not TOKEN:
     )
 
 
-def _outbound_display_name() -> str:
-    """Friendly display name for the ``From`` header (company-configurable)."""
+# Hard per-attempt transport deadline: a wedged SMTP host must never hold a
+# request (or a Render worker) open indefinitely.
+SMTP_TIMEOUT_SECONDS = 12
 
-    return os.getenv("BUSINESS_NAME") or "Saldora Billing"
+
+def _outbound_display_name() -> str:
+    """Friendly display name for the Resend ``From`` header (company-configurable)."""
+
+    return (os.getenv("BUSINESS_NAME") or "Saldora").strip() or "Saldora"
 
 
 def _resend_from_address() -> str:
-    """Outbound sender address: RESEND_FROM_EMAIL -> BUSINESS_EMAIL -> SENDER_EMAIL -> default."""
+    """Outbound sender address: RESEND_FROM_EMAIL -> BUSINESS_EMAIL -> Resend sandbox."""
 
     return (
-        os.getenv("RESEND_FROM_EMAIL")
-        or os.getenv("BUSINESS_EMAIL")
-        or SENDER_EMAIL
-        or "info@saldora.ai"
+        (os.getenv("RESEND_FROM_EMAIL") or "").strip()
+        or (os.getenv("BUSINESS_EMAIL") or "").strip()
+        or "onboarding@resend.dev"
     )
 
 
 def _resend_from_header() -> str:
-    """Clean RFC-style ``From`` for the Resend API: ``Saldora Billing <billing@saldora.ai>``."""
+    """Clean RFC-style ``From`` for the Resend API: ``Saldora <billing@saldora.ai>``."""
 
     return f"{_outbound_display_name()} <{_resend_from_address()}>"
 
 
-def _smtp_from_header() -> str:
-    """RFC 2047-safe ``From`` for SMTP (handles non-ASCII business names)."""
+def _smtp_settings() -> tuple[str, int, str, str, str]:
+    """Resolve SMTP transport settings at call time.
 
-    return formataddr((_outbound_display_name(), _resend_from_address()), charset="utf-8")
+    Reading the environment on every dispatch (instead of freezing it at import
+    time) keeps Render/hosted deployments correct after a restart and lets
+    callers rotate credentials without re-importing the module.
+
+    Returns ``(server, port, username, password, sender_email)`` with all
+    whitespace stripped from the password: a stray newline pasted from a
+    provider dashboard is the most common cause of ``SMTPAuthenticationError``.
+    """
+
+    server = (
+        (os.getenv("SMTP_SERVER") or "").strip()
+        or (SMTP_SERVER or "").strip()
+        or "smtp.gmail.com"
+    )
+    try:
+        port = int((os.getenv("SMTP_PORT") or "").strip() or SMTP_PORT)
+    except (TypeError, ValueError):
+        port = 587
+
+    username = (
+        (os.getenv("SMTP_USER") or "").strip()
+        or (os.getenv("SMTP_USERNAME") or "").strip()
+        or (SMTP_USERNAME or "").strip()
+        or (os.getenv("BUSINESS_EMAIL") or "").strip()
+    )
+    password = (
+        (os.getenv("SMTP_PASSWORD") or "").strip()
+        or (os.getenv("SMTP_PASS") or "").strip()
+        or (SMTP_PASSWORD or "").strip()
+    )
+    sender = (
+        (os.getenv("SENDER_EMAIL") or "").strip()
+        or (SENDER_EMAIL or "").strip()
+        or username
+        or (os.getenv("BUSINESS_EMAIL") or "").strip()
+    )
+    return server, port, username, password, sender
+
+
+def _smtp_from_header(sender_email: str | None = None) -> str:
+    """RFC 2047-safe ``From`` for SMTP: ``Saldora <billing@saldora.ai>``."""
+
+    _, _, username, _, configured_sender = _smtp_settings()
+    sender = (sender_email or configured_sender or username or "").strip()
+    return formataddr(("Saldora", sender), charset="utf-8")
 
 
 def _send_via_resend(
@@ -96,11 +144,15 @@ def _send_via_resend(
     extra_headers: Mapping[str, str] | None = None,
     attachment_path: str | Path | None = None,
     html_body: str | None = None,
-) -> tuple[bool, str]:
+) -> tuple[bool, str | None]:
     """Send one email through the Resend REST API (``resend.Emails.send``)."""
 
     if resend is None:
         return False, "resend package is not installed"
+
+    api_key = (os.getenv("RESEND_API_KEY") or "").strip()
+    if not api_key:
+        return False, "RESEND_API_KEY is not set"
 
     params: dict[str, object] = {
         "from": _resend_from_header(),
@@ -126,44 +178,47 @@ def _send_via_resend(
                 params["attachments"] = [
                     {"content": list(att.read_bytes()), "filename": att.name}
                 ]
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001 - attachment is best-effort
+                print(
+                    f"[email] Could not read attachment {att} for Resend: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
 
     try:
-        resend.api_key = os.environ["RESEND_API_KEY"]
+        resend.api_key = api_key
         resend.Emails.send(params=params)
-        return True, "Success"
-    except Exception as e:  # noqa: BLE001 - report any delivery failure to the caller
-        return False, f"Resend delivery failed: {str(e)}"
+        return True, None
+    except Exception as exc:  # noqa: BLE001 - report every delivery failure
+        print(
+            f"[email] Resend delivery to {recipient_email} failed: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return False, f"Resend delivery failed: {type(exc).__name__}: {exc}"
 
 
-def send_email_native(
+def _send_via_smtp(
     recipient_email: str,
     subject: str,
     body_text: str,
     extra_headers: Mapping[str, str] | None = None,
     attachment_path: str | Path | None = None,
     html_body: str | None = None,
-) -> tuple[bool, str]:
-    """Deliver an email: Resend API first (when configured), SMTP as fallback."""
+) -> tuple[bool, str | None]:
+    """Send one email over SMTP/STARTTLS and report the transport outcome.
 
-    if os.environ.get("RESEND_API_KEY"):
-        ok, message = _send_via_resend(
-            recipient_email, subject, body_text, extra_headers, attachment_path, html_body
-        )
-        if ok:
-            return True, message
-        # Degrade to SMTP when Resend failed and SMTP credentials exist;
-        # otherwise surface the Resend error to the caller.
-        smtp_configured = all([SMTP_SERVER, SMTP_USERNAME, SMTP_PASSWORD, SENDER_EMAIL])
-        if not smtp_configured:
-            return False, message
+    Port ``465`` uses implicit TLS (``smtplib.SMTP_SSL``); every other port
+    (including the default ``587``) uses ``SMTP`` + ``starttls()``. Both paths
+    carry the strict ``SMTP_TIMEOUT_SECONDS`` socket deadline.
+    """
 
-    if not all([SMTP_SERVER, SMTP_USERNAME, SMTP_PASSWORD, SENDER_EMAIL]):
+    server, port, username, password, sender = _smtp_settings()
+    if not all([server, username, password, sender]):
         return False, "Missing SMTP config in .env"
 
     msg = MIMEMultipart()
-    msg["From"] = _smtp_from_header()
+    msg["From"] = _smtp_from_header(sender)
     msg["To"] = recipient_email
     msg["Subject"] = subject
     for header_name, header_value in (extra_headers or {}).items():
@@ -194,17 +249,73 @@ def send_email_native(
                 part = MIMEApplication(att.read_bytes(), Name=att.name)
                 part["Content-Disposition"] = f'attachment; filename="{att.name}"'
                 msg.attach(part)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001 - attachment is best-effort
+                print(
+                    f"[email] Could not read attachment {att} for SMTP: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
 
     try:
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=30) as server:
-            server.starttls()
-            server.login(SMTP_USERNAME, SMTP_PASSWORD)
-            server.send_message(msg)
-        return True, "Success"
-    except Exception as e:  # noqa: BLE001 - report any delivery failure to the caller
-        return False, str(e)
+        if port == 465:
+            with smtplib.SMTP_SSL(server, port, timeout=SMTP_TIMEOUT_SECONDS) as smtp:
+                smtp.login(username, password)
+                smtp.send_message(msg)
+        else:
+            with smtplib.SMTP(server, port, timeout=SMTP_TIMEOUT_SECONDS) as smtp:
+                smtp.starttls()
+                smtp.login(username, password)
+                smtp.send_message(msg)
+        return True, None
+    except Exception as exc:  # noqa: BLE001 - report every delivery failure
+        print(
+            f"[email] SMTP delivery to {recipient_email} via {server}:{port} failed: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return False, f"SMTP delivery failed: {type(exc).__name__}: {exc}"
+
+
+def send_email_native(
+    recipient_email: str,
+    subject: str,
+    body_text: str,
+    extra_headers: Mapping[str, str] | None = None,
+    attachment_path: str | Path | None = None,
+    html_body: str | None = None,
+) -> tuple[bool, str | None]:
+    """Deliver an email: Resend API first (when configured), SMTP as fallback.
+
+    Returns ``(success, error_message)``. The function never raises and never
+    swallows a failure: transport errors are written to ``stderr`` for Render
+    logs and returned to the caller as ``error_message`` so HTTP routes can
+    answer honestly instead of reporting a delivery that did not happen.
+    """
+
+    if not str(recipient_email or "").strip():
+        return False, "Recipient email is empty"
+
+    resend_error: str | None = None
+    if (os.getenv("RESEND_API_KEY") or "").strip():
+        ok, resend_error = _send_via_resend(
+            recipient_email, subject, body_text, extra_headers, attachment_path, html_body
+        )
+        if ok:
+            return True, None
+        # Degrade to SMTP only when credentials exist; otherwise the Resend
+        # error is the most actionable message for the caller.
+        _, _, smtp_user, smtp_password, smtp_sender = _smtp_settings()
+        if not all([smtp_user, smtp_password, smtp_sender]):
+            return False, resend_error
+
+    ok, smtp_error = _send_via_smtp(
+        recipient_email, subject, body_text, extra_headers, attachment_path, html_body
+    )
+    if ok:
+        return True, None
+    if resend_error:
+        return False, f"{resend_error}; SMTP fallback failed: {smtp_error}"
+    return False, smtp_error
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -431,7 +542,7 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if success:
         text = f"Потсетникот за фактурата <b>{code}</b> беше успешно испратен преку е-пошта до <b>{target_email}</b>."
     else:
-        text = f"<b>Неуспешно испраќање:</b>\n<code>{message}</code>"
+        text = f"<b>Неуспешно испраќање:</b>\n<code>{message or 'непозната грешка'}</code>"
 
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 

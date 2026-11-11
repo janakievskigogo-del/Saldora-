@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2"
+         xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2"
+         xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2">
+  <cbc:UBLVersionID>2.1</cbc:UBLVersionID>
+  <cbc:ID>INV-20261111-9E9CD1</cbc:ID>
+  <cbc:IssueDate>2026-11-11</cbc:IssueDate>
+  <cbc:DueDate>2026-11-11</cbc:DueDate>
+  <cbc:DocumentCurrencyCode>MKD</cbc:DocumentCurrencyCode>
+  <cac:AccountingSupplierParty>
+    <cac:Party>
+      <cac:PartyName><cbc:Name>Saldora B2B</cbc:Name></cac:PartyName>
+    </cac:Party>
+  </cac:AccountingSupplierParty>
+  <cac:AccountingCustomerParty>
+    <cac:Party>
+      <cac:PartyName><cbc:Name>Изловен Сокет</cbc:Name></cac:PartyName>
+      <cac:PartyTaxScheme>
+        <cbc:CompanyID></cbc:CompanyID>
+        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>
+      </cac:PartyTaxScheme>
+      <cac:PostalAddress><cbc:StreetName></cbc:StreetName></cac:PostalAddress>
+    </cac:Party>
+  </cac:AccountingCustomerParty>
+  <cac:TaxTotal>
+    <cbc:TaxAmount currencyID="MKD">9.15</cbc:TaxAmount>
+  </cac:TaxTotal>
+  <cac:LegalMonetaryTotal>
+    <cbc:LineExtensionAmount currencyID="MKD">50.85</cbc:LineExtensionAmount>
+    <cbc:TaxExclusiveAmount currencyID="MKD">50.85</cbc:TaxExclusiveAmount>
+    <cbc:TaxInclusiveAmount currencyID="MKD">60.00</cbc:TaxInclusiveAmount>
+    <cbc:PayableAmount currencyID="MKD">60.00</cbc:PayableAmount>
+  </cac:LegalMonetaryTotal>
+</Invoice>

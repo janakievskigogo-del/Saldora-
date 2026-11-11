@@ -64,7 +64,8 @@ def test_request_otp_dispatches_and_persists():
     res = _request_otp(email, sent_log)
     assert res.status_code == 200, res.text
     data = res.json()
-    assert data["status"] == "sent"
+    assert data["status"] == "success"
+    assert data["message"] == "Verification code sent"
     assert data["expires_in_seconds"] == 300
 
     # Email dispatched exactly once, with the persisted code present
