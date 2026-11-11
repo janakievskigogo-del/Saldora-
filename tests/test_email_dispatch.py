@@ -7,7 +7,10 @@ report a delivery that did not happen: the signup OTP and the payment reminder.
 
 from __future__ import annotations
 
+import io
+import json
 import smtplib
+import urllib.error
 import uuid
 from email.header import decode_header, make_header
 from unittest.mock import patch
@@ -78,6 +81,26 @@ class _FakeResend:
         self.Emails = _FakeResendEmails()
 
 
+class _FakeWebhookResponse:
+    """Context-managed stand-in for ``urllib.request.urlopen``."""
+
+    def __init__(self, status: int = 200, body: bytes = b'{"ok": true}') -> None:
+        self.status = status
+        self._body = body
+
+    def getcode(self) -> int:
+        return self.status
+
+    def read(self, size: int | None = None) -> bytes:
+        return self._body[:size] if size else self._body
+
+    def __enter__(self) -> _FakeWebhookResponse:
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        return False
+
+
 @pytest.fixture(autouse=True)
 def _reset_transport_recorders():
     _RecordingSMTP.instances = []
@@ -92,6 +115,7 @@ def smtp_env(monkeypatch):
     """Deterministic SMTP-only configuration with a recording transport."""
 
     monkeypatch.delenv("RESEND_API_KEY", raising=False)
+    monkeypatch.delenv("GMAIL_WEBHOOK_URL", raising=False)
     monkeypatch.setenv("BUSINESS_NAME", "Saldora")
     monkeypatch.setenv("SMTP_SERVER", "smtp.test.mk")
     monkeypatch.setenv("SMTP_PORT", "587")
@@ -137,6 +161,62 @@ def test_smtp_port_465_uses_implicit_tls(smtp_env):
     smtp = _RecordingSMTP.instances[0]
     assert smtp.port == 465
     assert smtp.started_tls is False
+
+
+def test_gmail_webhook_is_primary_when_configured(smtp_env):
+    calls: list[tuple[object, float | None]] = []
+
+    def fake_urlopen(request, timeout=None):
+        calls.append((request, timeout))
+        return _FakeWebhookResponse()
+
+    fake_resend = _FakeResend()
+    smtp_env.setenv("GMAIL_WEBHOOK_URL", "https://script.google.com/test-relay")
+    smtp_env.setenv("RESEND_API_KEY", "re_test_key")
+    smtp_env.setattr(bot_service, "resend", fake_resend)
+    smtp_env.setattr(bot_service.urllib.request, "urlopen", fake_urlopen)
+
+    ok, error = bot_service.send_email_native(
+        "klient@firma.mk", "Тема", "Текст", html_body="<p>Текст</p>"
+    )
+
+    assert ok is True
+    assert error is None
+    assert len(calls) == 1
+    request, timeout = calls[0]
+    assert timeout == 15
+    assert request.full_url == "https://script.google.com/test-relay"
+    assert request.get_method() == "POST"
+    assert request.get_header("Content-type") == "application/json"
+    assert json.loads(request.data.decode("utf-8")) == {
+        "to": "klient@firma.mk",
+        "subject": "Тема",
+        "html": "<p>Текст</p>",
+        "text": "Текст",
+    }
+    # Webhook success must short-circuit both Resend and SMTP.
+    assert fake_resend.Emails.calls == []
+    assert _RecordingSMTP.instances == []
+
+
+def test_gmail_webhook_failure_degrades_to_smtp(smtp_env):
+    def failing_urlopen(request, timeout=None):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            500,
+            "Server Error",
+            hdrs=None,
+            fp=io.BytesIO(b"relay down"),
+        )
+
+    smtp_env.setenv("GMAIL_WEBHOOK_URL", "https://script.google.com/test-relay")
+    smtp_env.setattr(bot_service.urllib.request, "urlopen", failing_urlopen)
+
+    ok, error = bot_service.send_email_native("klient@firma.mk", "Тема", "Текст")
+
+    assert ok is True
+    assert error is None
+    assert len(_RecordingSMTP.instances) == 1
 
 
 def test_resend_is_primary_when_api_key_present(smtp_env):

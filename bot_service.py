@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import secrets
 import smtplib
 import sys
+import urllib.error
+import urllib.request
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from email.mime.application import MIMEApplication
@@ -63,6 +66,10 @@ if not TOKEN:
 # Hard per-attempt transport deadline: a wedged SMTP host must never hold a
 # request (or a Render worker) open indefinitely.
 SMTP_TIMEOUT_SECONDS = 12
+
+# The Gmail relay (Google Apps Script web app) gets a slightly larger deadline
+# than SMTP because it may cold-start before answering.
+WEBHOOK_TIMEOUT_SECONDS = 15
 
 
 def _outbound_display_name() -> str:
@@ -135,6 +142,67 @@ def _smtp_from_header(sender_email: str | None = None) -> str:
     _, _, username, _, configured_sender = _smtp_settings()
     sender = (sender_email or configured_sender or username or "").strip()
     return formataddr(("Saldora", sender), charset="utf-8")
+
+
+def _send_via_webhook(
+    recipient_email: str,
+    subject: str,
+    body_text: str,
+    html_body: str | None = None,
+) -> tuple[bool, str | None]:
+    """POST the message to ``GMAIL_WEBHOOK_URL`` (a Gmail/Apps Script relay).
+
+    Returns success only on HTTP 200. Any transport error, non-200 status or
+    malformed response is logged to ``stderr`` and reported so the caller can
+    fall back to the next transport instead of assuming delivery.
+    """
+
+    url = (os.getenv("GMAIL_WEBHOOK_URL") or "").strip()
+    if not url:
+        return False, "GMAIL_WEBHOOK_URL is not set"
+
+    payload = {
+        "to": recipient_email,
+        "subject": subject,
+        "html": html_body or "",
+        "text": body_text,
+    }
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(
+            request, timeout=WEBHOOK_TIMEOUT_SECONDS
+        ) as response:
+            status_code = getattr(response, "status", None) or response.getcode()
+            if status_code == 200:
+                return True, None
+            detail = response.read(500).decode("utf-8", "replace")
+            print(
+                f"[email] Gmail webhook for {recipient_email} returned HTTP "
+                f"{status_code}: {detail}",
+                file=sys.stderr,
+            )
+            return False, f"Gmail webhook returned HTTP {status_code}: {detail}"
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:500]
+        print(
+            f"[email] Gmail webhook for {recipient_email} failed: HTTP "
+            f"{exc.code}: {detail}",
+            file=sys.stderr,
+        )
+        return False, f"Gmail webhook delivery failed: HTTP {exc.code}: {detail}"
+    except Exception as exc:  # noqa: BLE001 - report every delivery failure
+        print(
+            f"[email] Gmail webhook for {recipient_email} failed: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return False, f"Gmail webhook delivery failed: {type(exc).__name__}: {exc}"
 
 
 def _send_via_resend(
@@ -284,7 +352,7 @@ def send_email_native(
     attachment_path: str | Path | None = None,
     html_body: str | None = None,
 ) -> tuple[bool, str | None]:
-    """Deliver an email: Resend API first (when configured), SMTP as fallback.
+    """Deliver an email: Gmail webhook first, then Resend, then SMTP.
 
     Returns ``(success, error_message)``. The function never raises and never
     swallows a failure: transport errors are written to ``stderr`` for Render
@@ -295,26 +363,39 @@ def send_email_native(
     if not str(recipient_email or "").strip():
         return False, "Recipient email is empty"
 
-    resend_error: str | None = None
+    transport_errors: list[str] = []
+
+    if (os.getenv("GMAIL_WEBHOOK_URL") or "").strip():
+        ok, webhook_error = _send_via_webhook(
+            recipient_email, subject, body_text, html_body
+        )
+        if ok:
+            return True, None
+        if webhook_error:
+            transport_errors.append(webhook_error)
+
     if (os.getenv("RESEND_API_KEY") or "").strip():
         ok, resend_error = _send_via_resend(
             recipient_email, subject, body_text, extra_headers, attachment_path, html_body
         )
         if ok:
             return True, None
-        # Degrade to SMTP only when credentials exist; otherwise the Resend
-        # error is the most actionable message for the caller.
+        if resend_error:
+            transport_errors.append(resend_error)
+        # Degrade to SMTP only when credentials exist; otherwise surface every
+        # attempted transport's error to the caller.
         _, _, smtp_user, smtp_password, smtp_sender = _smtp_settings()
         if not all([smtp_user, smtp_password, smtp_sender]):
-            return False, resend_error
+            return False, "; ".join(transport_errors) or "Email delivery failed"
 
     ok, smtp_error = _send_via_smtp(
         recipient_email, subject, body_text, extra_headers, attachment_path, html_body
     )
     if ok:
         return True, None
-    if resend_error:
-        return False, f"{resend_error}; SMTP fallback failed: {smtp_error}"
+    if transport_errors:
+        transport_errors.append(f"SMTP fallback failed: {smtp_error}")
+        return False, "; ".join(transport_errors)
     return False, smtp_error
 
 
