@@ -147,7 +147,7 @@ DbSession = Annotated[Session, Depends(get_db)]
 # JWT Authentication & Passwords
 # ---------------------------------------------------------------------------
 
-JWT_SECRET = os.environ.get("JWT_SECRET", "saldora-vault-secret-key-2026-institutional-suite")
+JWT_SECRET = os.getenv("JWT_SECRET", "saldora_fallback_secret_key_2026")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 

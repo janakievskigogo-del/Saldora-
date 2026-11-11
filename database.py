@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -9,16 +10,24 @@ from contextlib import contextmanager
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine, make_url
+from sqlalchemy.exc import ArgumentError
 from sqlalchemy.orm import Session, sessionmaker
 
 from models import Base
 
 __all__ = ["DATABASE_URL", "engine", "SessionLocal", "get_db", "init_db"]
 
+logger = logging.getLogger(__name__)
+
 # ``DATABASE_URL`` is read at import time, which can happen before api.py's
 # load_dotenv() call — so resolve it from .env here too. override=False keeps
 # an explicitly exported environment variable authoritative.
 load_dotenv(override=False)
+
+# Safe local fallback: a missing/blank/malformed DATABASE_URL must never crash
+# ``create_engine()`` during module import (e.g. a blank env var on a PaaS).
+_FALLBACK_SQLITE_URL = "sqlite:///./fallback.db"
+_SUPPORTED_BACKENDS = frozenset({"sqlite", "postgresql"})
 
 
 def _normalise_postgres_url(url_string: str) -> str:
@@ -33,9 +42,56 @@ def _normalise_postgres_url(url_string: str) -> str:
     return url_string
 
 
-DATABASE_URL = _normalise_postgres_url(
-    os.environ.get("DATABASE_URL", "sqlite:///saldora.db")
-)
+def _mask_url(url_string: str) -> str:
+    """Render a connection string without ever exposing credentials."""
+
+    scheme, _, rest = url_string.partition("://")
+    authority = rest.split("@")[-1].split("/")[0] if rest else ""
+    return f"{scheme}://***@{authority}" if authority else f"{scheme}://***"
+
+
+def _resolve_database_url() -> str:
+    """Resolve ``DATABASE_URL`` into a safe, parseable URL at import time.
+
+    Authority order (mirrors ``load_dotenv(override=False)``):
+
+    1. explicitly exported ``DATABASE_URL``,
+    2. ``.env`` ``DATABASE_URL``,
+    3. local SQLite fallback (with a clean warning — never an import crash).
+    """
+
+    raw = (os.getenv("DATABASE_URL") or "").strip()
+    if not raw:
+        logger.warning(
+            "DATABASE_URL is not set — falling back to local SQLite (%s).",
+            _FALLBACK_SQLITE_URL,
+        )
+        return _FALLBACK_SQLITE_URL
+
+    url = _normalise_postgres_url(raw)
+    try:
+        backend = make_url(url).get_backend_name()
+    except ArgumentError:
+        logger.warning(
+            "DATABASE_URL could not be parsed (%s) — falling back to local SQLite (%s).",
+            _mask_url(raw),
+            _FALLBACK_SQLITE_URL,
+        )
+        return _FALLBACK_SQLITE_URL
+
+    if backend not in _SUPPORTED_BACKENDS:
+        logger.warning(
+            "DATABASE_URL backend %r is unsupported (expected sqlite or postgresql) "
+            "— falling back to local SQLite (%s).",
+            backend,
+            _FALLBACK_SQLITE_URL,
+        )
+        return _FALLBACK_SQLITE_URL
+
+    return url
+
+
+DATABASE_URL = _resolve_database_url()
 
 
 def _ensure_sqlite_directory(url_string: str) -> None:
@@ -77,14 +133,30 @@ else:
     # - ``pool_size``/``max_overflow``  10 steady + up to 20 burst connections,
     #   sized for serverless/API concurrency without exhausting Supabase's
     #   direct-connection cap.
-    engine = create_engine(
-        DATABASE_URL,
-        echo=False,
-        pool_pre_ping=True,
-        pool_size=10,
-        max_overflow=20,
-        pool_recycle=300,
-    )
+    try:
+        engine = create_engine(
+            DATABASE_URL,
+            echo=False,
+            pool_pre_ping=True,
+            pool_size=10,
+            max_overflow=20,
+            pool_recycle=300,
+        )
+    except Exception as exc:  # noqa: BLE001 - e.g. psycopg driver not installed
+        logger.warning(
+            "Could not create the PostgreSQL engine (%s: %s) — falling back to "
+            "local SQLite (%s). Install psycopg for Supabase: pip install "
+            "psycopg[binary].",
+            type(exc).__name__,
+            exc,
+            _FALLBACK_SQLITE_URL,
+        )
+        DATABASE_URL = _FALLBACK_SQLITE_URL
+        engine = create_engine(
+            DATABASE_URL,
+            echo=False,
+            connect_args=_connect_args(DATABASE_URL),
+        )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 

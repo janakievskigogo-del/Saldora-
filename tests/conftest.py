@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import os
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
+
+# The test suite is SQLite-based (init_db migrations, PRAGMA, etc.). Pin the
+# engine BEFORE any project import so a production DATABASE_URL — e.g. the
+# Supabase pooler in .env — can never receive test data. database.py honours
+# explicitly exported variables over .env (load_dotenv(override=False)).
+os.environ["DATABASE_URL"] = "sqlite:///saldora.db"
 
 from config import Settings
 from database import init_db
