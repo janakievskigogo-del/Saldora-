@@ -744,8 +744,27 @@ def _max_numeric_suffix(values: Iterable[str | None], prefix: str) -> int:
     return highest
 
 
+def _code_is_taken(db: Session, code: str) -> bool:
+    """True when ``code`` already exists as an ``Invoice.code`` or ``Invoice.id``."""
+
+    return (
+        db.query(Invoice.id)
+        .filter(or_(Invoice.code == code, Invoice.id == code))
+        .first()
+        is not None
+    )
+
+
 def _next_invoice_code(db: Session) -> str:
-    """Allocate the next ``NPL-2026-XXXX`` code from the highest existing one."""
+    """Allocate the next unique ``NPL-2026-XXXX`` invoice / e-Faktura code.
+
+    The sequence is derived from the highest numeric suffix actually stored in
+    the database — never a blind increment — and the candidate is then verified
+    against both ``Invoice.code`` and ``Invoice.id`` before it is returned, so
+    ``db.commit()`` receives a collision-free code. Taken candidates roll the
+    sequence forward; if the sequential block is somehow exhausted, a short
+    random suffix guarantees freshness.
+    """
 
     rows = (
         db.query(Invoice.code, Invoice.id)
@@ -761,21 +780,74 @@ def _next_invoice_code(db: Session) -> str:
     candidates: list[str | None] = []
     for code, invoice_id in rows:
         candidates.extend((code, invoice_id))
-    highest = _max_numeric_suffix(candidates, INVOICE_PREFIX)
+    sequence = _max_numeric_suffix(candidates, INVOICE_PREFIX)
 
-    return f"{INVOICE_PREFIX}{highest + 1:04d}"
+    # Roll the sequence forward past any explicit collision.
+    for _ in range(100):
+        candidate = f"{INVOICE_PREFIX}{sequence + 1:04d}"
+        if not _code_is_taken(db, candidate):
+            return candidate
+        sequence += 1
+
+    # Deterministic allocation failed: fall back to a short random suffix so
+    # the insert still gets a unique code (e.g. ``NPL-2026-0101-9F3A``).
+    # Bounded: a 16-bit suffix collides with probability ~2^-16 per draw, so
+    # 25 attempts are statistically certain; anything beyond that means the
+    # uniqueness oracle itself is broken and must surface as a hard error
+    # instead of a silent hang.
+    for _ in range(25):
+        fallback = (
+            f"{INVOICE_PREFIX}{sequence + 1:04d}-{secrets.token_hex(2).upper()}"
+        )
+        if not _code_is_taken(db, fallback):
+            return fallback
+
+    raise RuntimeError(
+        "Could not allocate a unique invoice code after sequential and "
+        "random-suffix allocation attempts."
+    )
 
 
 DELIVERY_NOTE_PREFIX = "ISP-2026-"
 
 
 def _next_delivery_note_code(db: Session) -> str:
-    """Allocate the next ``ISP-2026-XXXX`` code from the highest existing one."""
+    """Allocate the next unique ``ISP-2026-XXXX`` delivery-note code."""
+
     rows = db.query(DeliveryNote.code).filter(
         DeliveryNote.code.like(f"{DELIVERY_NOTE_PREFIX}%")
     )
-    highest = _max_numeric_suffix((code for (code,) in rows), DELIVERY_NOTE_PREFIX)
-    return f"{DELIVERY_NOTE_PREFIX}{highest + 1:04d}"
+    sequence = _max_numeric_suffix((code for (code,) in rows), DELIVERY_NOTE_PREFIX)
+
+    # Roll the sequence forward past any explicit collision.
+    for _ in range(100):
+        candidate = f"{DELIVERY_NOTE_PREFIX}{sequence + 1:04d}"
+        if (
+            db.query(DeliveryNote.id)
+            .filter(DeliveryNote.code == candidate)
+            .first()
+            is None
+        ):
+            return candidate
+        sequence += 1
+
+    # Deterministic allocation failed: short random suffix guarantees freshness.
+    for _ in range(25):
+        fallback = (
+            f"{DELIVERY_NOTE_PREFIX}{sequence + 1:04d}-{secrets.token_hex(2).upper()}"
+        )
+        if (
+            db.query(DeliveryNote.id)
+            .filter(DeliveryNote.code == fallback)
+            .first()
+            is None
+        ):
+            return fallback
+
+    raise RuntimeError(
+        "Could not allocate a unique delivery-note code after sequential and "
+        "random-suffix allocation attempts."
+    )
 
 
 def _find_delivery_note(

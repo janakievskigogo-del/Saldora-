@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import formataddr
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -56,15 +57,33 @@ if not TOKEN:
     )
 
 
-def _resend_from_address() -> str | None:
-    """Resolve the Resend sender identity from the environment."""
+def _outbound_display_name() -> str:
+    """Friendly display name for the ``From`` header (company-configurable)."""
+
+    return os.getenv("BUSINESS_NAME") or "Saldora Billing"
+
+
+def _resend_from_address() -> str:
+    """Outbound sender address: RESEND_FROM_EMAIL -> BUSINESS_EMAIL -> SENDER_EMAIL -> default."""
 
     return (
         os.getenv("RESEND_FROM_EMAIL")
         or os.getenv("BUSINESS_EMAIL")
         or SENDER_EMAIL
-        or None
+        or "info@saldora.ai"
     )
+
+
+def _resend_from_header() -> str:
+    """Clean RFC-style ``From`` for the Resend API: ``Saldora Billing <billing@saldora.ai>``."""
+
+    return f"{_outbound_display_name()} <{_resend_from_address()}>"
+
+
+def _smtp_from_header() -> str:
+    """RFC 2047-safe ``From`` for SMTP (handles non-ASCII business names)."""
+
+    return formataddr((_outbound_display_name(), _resend_from_address()), charset="utf-8")
 
 
 def _send_via_resend(
@@ -80,15 +99,8 @@ def _send_via_resend(
     if resend is None:
         return False, "resend package is not installed"
 
-    from_email = _resend_from_address()
-    if not from_email:
-        return False, (
-            "Missing Resend sender address: set RESEND_FROM_EMAIL, "
-            "BUSINESS_EMAIL or SENDER_EMAIL"
-        )
-
     params: dict[str, object] = {
-        "from": from_email,
+        "from": _resend_from_header(),
         "to": recipient_email,
         "subject": subject,
         "text": body_text,
@@ -148,7 +160,7 @@ def send_email_native(
         return False, "Missing SMTP config in .env"
 
     msg = MIMEMultipart()
-    msg["From"] = SENDER_EMAIL
+    msg["From"] = _smtp_from_header()
     msg["To"] = recipient_email
     msg["Subject"] = subject
     for header_name, header_value in (extra_headers or {}).items():
