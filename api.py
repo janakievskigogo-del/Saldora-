@@ -20,7 +20,6 @@ Defensive notes
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import html as html_module
 import json
@@ -38,7 +37,7 @@ from typing import Annotated, Any
 
 import bcrypt
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
 from fastapi import status as http_status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -1201,14 +1200,33 @@ def _otp_email_html(email: str, code: str, minutes: int) -> str:
 </body></html>"""
 
 
+def _send_signup_otp_email(recipient: str, subject: str, body_text: str, html_body: str) -> None:
+    """Background-task worker for signup OTP delivery.
+
+    ``send_email_native`` never raises, so a provider outage only logs here —
+    the client already received an instant response.
+    """
+
+    ok, message = send_email_native(recipient, subject, body_text, html_body=html_body)
+    if not ok:
+        logger.error("OTP email dispatch to %s failed: %s", recipient, message)
+    else:
+        logger.info("Signup OTP dispatched to %s.", recipient)
+
+
 @app.post("/api/signup/request-otp")
-def request_signup_otp(payload: SignupOTPRequest, db: DbSession) -> dict[str, Any]:
+def request_signup_otp(
+    payload: SignupOTPRequest,
+    background_tasks: BackgroundTasks,
+    db: DbSession,
+) -> dict[str, Any]:
     """Validate the address and password policy, then dispatch a 6-digit code.
 
     The wizard includes ``password`` and ``password_confirm`` so an invalid
     password is rejected before an OTP email is sent. API clients that omit the
     password still receive a code; the final ``complete`` call always enforces
-    the policy again.
+    the policy again. The email itself is dispatched via ``BackgroundTasks`` so
+    the endpoint responds instantly without blocking on the mail provider.
     """
 
     if payload.password is not None:
@@ -1242,19 +1260,13 @@ def request_signup_otp(payload: SignupOTPRequest, db: DbSession) -> dict[str, An
         f"Кодот е валиден 5 минути и може да се искористи само еднаш.\n"
         f"Ако вие не побаравте сметка, игнорирајте ја пораката.\n\nSaldora"
     )
-    ok, message = send_email_native(
+    background_tasks.add_task(
+        _send_signup_otp_email,
         email,
         subject,
         body_text,
-        html_body=_otp_email_html(email, code, OTP_TTL_SECONDS // 60),
+        _otp_email_html(email, code, OTP_TTL_SECONDS // 60),
     )
-    if not ok:
-        logger.error("OTP email dispatch to %s failed: %s", email, message)
-        raise HTTPException(
-            status_code=http_status.HTTP_502_BAD_GATEWAY,
-            detail="Неуспешно испраќање на верификационен код. Обидете се повторно.",
-        )
-    logger.info("Signup OTP dispatched to %s.", email)
     return {"status": "sent", "expires_in_seconds": OTP_TTL_SECONDS}
 
 
@@ -1807,10 +1819,11 @@ def storno_invoice(
 async def remind_invoice(
     code: str,
     payload: RemindRequest,
+    background_tasks: BackgroundTasks,
     db: DbSession,
     current_user: CurrentUser,
 ) -> dict[str, Any] | JSONResponse:
-    """Send a real SMTP payment reminder for an invoice."""
+    """Send a real payment reminder for an invoice (non-blocking dispatch)."""
 
     invoice = _require_owned_invoice(db, code, current_user.id)
 
@@ -1835,35 +1848,21 @@ async def remind_invoice(
     elif (XML_DIR / f"{invoice_code}.xml").is_file():
         attachment_file = str(XML_DIR / f"{invoice_code}.xml")
 
-    # End the read transaction before the blocking SMTP round-trip so a slow
-    # mail server cannot hold a SQLite lock and stall invoice writes.
+    # End the read transaction before the background delivery task runs, so a
+    # slow mail server cannot hold a SQLite lock and stall invoice writes.
     db.rollback()
 
-    try:
-        success, message = await asyncio.to_thread(
-            send_email_native,
-            recipient,
-            subject,
-            body,
-            None,
-            attachment_file,
-        )
-    except Exception as exc:  # noqa: BLE001 - surface any sender failure as 502
-        logger.exception("Unexpected email sender failure for %s", invoice_code)
-        raise HTTPException(
-            status_code=http_status.HTTP_502_BAD_GATEWAY,
-            detail="The email service is unavailable.",
-        ) from exc
-
-    if not success:
-        logger.warning("SMTP reminder failed for %s: %s", invoice_code, message)
-        return JSONResponse(
-            status_code=http_status.HTTP_502_BAD_GATEWAY,
-            content={
-                "success": False,
-                "message": f"Email could not be sent: {message}",
-            },
-        )
+    # Deliver via a FastAPI background task (Starlette runs the sync sender in
+    # the threadpool): the client gets an instant response, and delivery
+    # failures are logged instead of blocking the request.
+    background_tasks.add_task(
+        send_email_native,
+        recipient,
+        subject,
+        body,
+        None,
+        attachment_file,
+    )
 
     return {"success": True, "message": f"Email sent to {recipient}"}
 
@@ -2304,11 +2303,12 @@ def _require_owned_draft(db: Session, draft_id: int, user_id: int) -> EmailDraft
 @app.post("/api/email-drafts/{draft_id}/approve")
 async def approve_email_draft(
     draft_id: int,
+    background_tasks: BackgroundTasks,
     db: DbSession,
     current_user: CurrentUser,
     payload: EmailDraftApproveRequest | None = None,
 ) -> dict[str, Any]:
-    """Approve and dispatch an AI email draft (optionally edited) via SMTP."""
+    """Approve an AI email draft (optionally edited) and dispatch it in the background."""
     draft = _require_owned_draft(db, draft_id, current_user.id)
 
     body_to_send = (
@@ -2330,30 +2330,6 @@ async def approve_email_draft(
     if not subject.lower().startswith("re:"):
         subject = f"Re: {subject}"
 
-    db.rollback()
-
-    try:
-        success, message = await asyncio.to_thread(
-            send_email_native,
-            draft.client_email,
-            subject,
-            body_to_send,
-            None,
-            attachment_path,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Failed to send approved draft #%d", draft_id)
-        raise HTTPException(
-            status_code=http_status.HTTP_502_BAD_GATEWAY,
-            detail="The email service is unavailable.",
-        ) from exc
-
-    if not success:
-        raise HTTPException(
-            status_code=http_status.HTTP_502_BAD_GATEWAY,
-            detail=f"Email dispatch failed: {message}",
-        )
-
     draft.status = "SENT"
     draft.ai_draft_response = body_to_send
     try:
@@ -2366,6 +2342,19 @@ async def approve_email_draft(
             status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update draft state.",
         ) from exc
+
+    # Deliver via a FastAPI background task (Starlette runs the sync sender in
+    # the threadpool): the approval result returns instantly and the Resend /
+    # SMTP round-trip happens off-request. ``send_email_native`` never raises,
+    # so delivery failures surface only in the log.
+    background_tasks.add_task(
+        send_email_native,
+        draft.client_email,
+        subject,
+        body_to_send,
+        None,
+        attachment_path,
+    )
 
     return {
         "success": True,

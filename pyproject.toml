@@ -31,6 +31,10 @@ dev = [
     "ruff>=0.17,<1.0",
 ]
 
+[tool.vercel]
+# Vercel's Python builder imports this module and serves this ASGI app.
+entrypoint = "api:app"
+
 [tool.ruff]
 target-version = "py310"
 line-length = 100

@@ -19,7 +19,23 @@ __all__ = ["DATABASE_URL", "engine", "SessionLocal", "get_db", "init_db"]
 # load_dotenv() call — so resolve it from .env here too. override=False keeps
 # an explicitly exported environment variable authoritative.
 load_dotenv(override=False)
-DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///saldora.db")
+
+
+def _normalise_postgres_url(url_string: str) -> str:
+    """Convert ``postgres://`` to ``postgresql://`` for SQLAlchemy compatibility.
+
+    Supabase and most PaaS providers hand out ``postgres://`` connection strings;
+    SQLAlchemy 2.x only accepts the ``postgresql://`` scheme.
+    """
+
+    if url_string.startswith("postgres://"):
+        return "postgresql://" + url_string[len("postgres://") :]
+    return url_string
+
+
+DATABASE_URL = _normalise_postgres_url(
+    os.environ.get("DATABASE_URL", "sqlite:///saldora.db")
+)
 
 
 def _ensure_sqlite_directory(url_string: str) -> None:
@@ -44,11 +60,31 @@ def _connect_args(url_string: str) -> dict[str, object]:
     return {}
 
 
-engine: Engine = create_engine(
-    DATABASE_URL,
-    echo=False,
-    connect_args=_connect_args(DATABASE_URL),
-)
+_engine_backend = make_url(DATABASE_URL).get_backend_name()
+
+if _engine_backend == "sqlite":
+    engine: Engine = create_engine(
+        DATABASE_URL,
+        echo=False,
+        connect_args=_connect_args(DATABASE_URL),
+    )
+else:
+    # PostgreSQL / Supabase: production connection pooling.
+    # - ``pool_pre_ping``  rebuilds connections dropped by Supabase's pooler or
+    #   idle disconnects instead of surfacing them as "server closed" 500s.
+    # - ``pool_recycle``   proactively renews connections before server-side
+    #   timeouts can kill them (Vercel/Supabase idle limits).
+    # - ``pool_size``/``max_overflow``  10 steady + up to 20 burst connections,
+    #   sized for serverless/API concurrency without exhausting Supabase's
+    #   direct-connection cap.
+    engine = create_engine(
+        DATABASE_URL,
+        echo=False,
+        pool_pre_ping=True,
+        pool_size=10,
+        max_overflow=20,
+        pool_recycle=300,
+    )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -65,6 +101,12 @@ def get_db() -> Iterator[Session]:
 def init_db() -> None:
     """Create all tables defined in models.py if they don't exist and ensure schema migrations."""
     Base.metadata.create_all(bind=engine)
+    if make_url(engine.url).get_backend_name() != "sqlite":
+        # The additive migrations below are SQLite-only (PRAGMA introspection).
+        # On PostgreSQL the schema is fully covered by ``create_all`` —
+        # models.py already declares every migrated column — plus external
+        # migrations managed in Supabase.
+        return
     with engine.begin() as conn:
         for table in ["clients", "invoices", "delivery_notes", "email_drafts"]:
             result = conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()

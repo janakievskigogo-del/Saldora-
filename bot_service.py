@@ -17,6 +17,13 @@ from models import DeliveryNote, Invoice
 
 load_dotenv()
 
+# Resend is the preferred delivery provider (in requirements.txt). The import is
+# soft so a missing install can never kill the FastAPI process at import time.
+try:
+    import resend
+except ImportError:  # pragma: no cover - depends on optional install
+    resend = None  # type: ignore[assignment]
+
 # Telegram is optional for the HTTP API: api.py only needs send_email_native.
 # Keeping these imports soft means importing bot_service can never kill the
 # FastAPI process (previously a missing token called sys.exit at import time).
@@ -49,6 +56,72 @@ if not TOKEN:
     )
 
 
+def _resend_from_address() -> str | None:
+    """Resolve the Resend sender identity from the environment."""
+
+    return (
+        os.getenv("RESEND_FROM_EMAIL")
+        or os.getenv("BUSINESS_EMAIL")
+        or SENDER_EMAIL
+        or None
+    )
+
+
+def _send_via_resend(
+    recipient_email: str,
+    subject: str,
+    body_text: str,
+    extra_headers: Mapping[str, str] | None = None,
+    attachment_path: str | Path | None = None,
+    html_body: str | None = None,
+) -> tuple[bool, str]:
+    """Send one email through the Resend REST API (``resend.Emails.send``)."""
+
+    if resend is None:
+        return False, "resend package is not installed"
+
+    from_email = _resend_from_address()
+    if not from_email:
+        return False, (
+            "Missing Resend sender address: set RESEND_FROM_EMAIL, "
+            "BUSINESS_EMAIL or SENDER_EMAIL"
+        )
+
+    params: dict[str, object] = {
+        "from": from_email,
+        "to": recipient_email,
+        "subject": subject,
+        "text": body_text,
+    }
+    if html_body:
+        params["html"] = html_body
+
+    headers = {
+        str(name).strip(): str(value).strip()
+        for name, value in (extra_headers or {}).items()
+        if str(name).strip() and str(value).strip()
+    }
+    if headers:
+        params["headers"] = headers
+
+    if attachment_path:
+        att = Path(attachment_path)
+        if att.is_file():
+            try:
+                params["attachments"] = [
+                    {"content": list(att.read_bytes()), "filename": att.name}
+                ]
+            except Exception:  # noqa: BLE001
+                pass
+
+    try:
+        resend.api_key = os.environ["RESEND_API_KEY"]
+        resend.Emails.send(params=params)
+        return True, "Success"
+    except Exception as e:  # noqa: BLE001 - report any delivery failure to the caller
+        return False, f"Resend delivery failed: {str(e)}"
+
+
 def send_email_native(
     recipient_email: str,
     subject: str,
@@ -57,6 +130,20 @@ def send_email_native(
     attachment_path: str | Path | None = None,
     html_body: str | None = None,
 ) -> tuple[bool, str]:
+    """Deliver an email: Resend API first (when configured), SMTP as fallback."""
+
+    if os.environ.get("RESEND_API_KEY"):
+        ok, message = _send_via_resend(
+            recipient_email, subject, body_text, extra_headers, attachment_path, html_body
+        )
+        if ok:
+            return True, message
+        # Degrade to SMTP when Resend failed and SMTP credentials exist;
+        # otherwise surface the Resend error to the caller.
+        smtp_configured = all([SMTP_SERVER, SMTP_USERNAME, SMTP_PASSWORD, SENDER_EMAIL])
+        if not smtp_configured:
+            return False, message
+
     if not all([SMTP_SERVER, SMTP_USERNAME, SMTP_PASSWORD, SENDER_EMAIL]):
         return False, "Missing SMTP config in .env"
 
