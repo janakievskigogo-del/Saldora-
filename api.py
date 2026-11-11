@@ -94,7 +94,7 @@ DEFAULT_VAT_RATE = Decimal("18.00")
 CENT = Decimal("0.01")
 ALLOWED_STATUSES = {"UNPAID", "PAID", "STORNO"}
 DEFAULT_STORNO_REASON = "Сторнирано по барање на корисникот"
-MAX_CODE_ALLOCATION_ATTEMPTS = 5
+MAX_CODE_ALLOCATION_ATTEMPTS = 3
 
 # ---------------------------------------------------------------------------
 # JSON safety net
@@ -744,110 +744,109 @@ def _max_numeric_suffix(values: Iterable[str | None], prefix: str) -> int:
     return highest
 
 
-def _code_is_taken(db: Session, code: str) -> bool:
-    """True when ``code`` already exists as an ``Invoice.code`` or ``Invoice.id``."""
+_CODE_SUFFIX_ALPHABET = string.digits + string.ascii_uppercase
 
-    return (
-        db.query(Invoice.id)
-        .filter(or_(Invoice.code == code, Invoice.id == code))
-        .first()
-        is not None
+
+def _code_exists(db: Session, model: type, code: str) -> bool:
+    """True when ``code`` is already used by ``model``.
+
+    ``Invoice`` mirrors its code into the string primary key ``id``, so both
+    columns are checked; other models (e.g. ``DeliveryNote``) use an integer
+    PK and only carry the unique ``code`` column.
+    """
+
+    if model is Invoice:
+        return (
+            db.query(Invoice.id)
+            .filter(or_(Invoice.code == code, Invoice.id == code))
+            .first()
+            is not None
+        )
+    return db.query(model.id).filter(model.code == code).first() is not None
+
+
+def _code_is_taken(db: Session, code: str) -> bool:
+    """Backwards-compatible alias: invoices use ``_code_exists`` semantics."""
+
+    return _code_exists(db, Invoice, code)
+
+
+def generate_guaranteed_unique_code(
+    db: Session,
+    model: type,
+    prefix: str,
+    *,
+    year: int | None = None,
+) -> str:
+    """Allocate a guaranteed-unique ``{prefix}-{YEAR}-{NNNN}`` business code.
+
+    1. Scans every stored code matching ``{prefix}-{YEAR}-%`` (for invoices
+       also their mirrored ``id`` PK) and takes the highest integer suffix —
+       never a blind increment.
+    2. Increments it and verifies the candidate with an explicit existence
+       query (``model.code == candidate``), rolling the sequence forward past
+       any collision.
+    3. If the sequential block is somehow blocked, appends a random
+       4-character uppercase alphanumeric suffix (``ISP-2026-0001-B3X1``)
+       which is 100% unique under high concurrency; both stages are bounded
+       and raise ``RuntimeError`` instead of hanging when the uniqueness
+       oracle itself is broken.
+    """
+
+    year_part = year if year is not None else date.today().year
+    scope_prefix = f"{prefix}-{year_part}-"
+
+    existing: list[str | None] = [
+        row[0]
+        for row in db.query(model.code)
+        .filter(model.code.like(f"{scope_prefix}%"))
+        .all()
+    ]
+    if model is Invoice:
+        existing += [
+            row[0]
+            for row in db.query(Invoice.id)
+            .filter(Invoice.id.like(f"{scope_prefix}%"))
+            .all()
+        ]
+    sequence = _max_numeric_suffix(existing, scope_prefix)
+
+    # Roll the sequence forward past any explicit collision.
+    for _ in range(100):
+        candidate = f"{scope_prefix}{sequence + 1:04d}"
+        if not _code_exists(db, model, candidate):
+            return candidate
+        sequence += 1
+
+    # Deterministic allocation failed: a random 4-char alphanumeric suffix
+    # (36^4 = 1.68M combinations) guarantees uniqueness under concurrency.
+    for _ in range(25):
+        suffix = "".join(
+            secrets.choice(_CODE_SUFFIX_ALPHABET) for _ in range(4)
+        )
+        candidate = f"{scope_prefix}{sequence + 1:04d}-{suffix}"
+        if not _code_exists(db, model, candidate):
+            return candidate
+
+    raise RuntimeError(
+        f"Could not allocate a unique {prefix} code after sequential and "
+        "random-suffix allocation attempts."
     )
 
 
 def _next_invoice_code(db: Session) -> str:
-    """Allocate the next unique ``NPL-2026-XXXX`` invoice / e-Faktura code.
+    """Allocate the next unique e-Faktura (invoice) code."""
 
-    The sequence is derived from the highest numeric suffix actually stored in
-    the database — never a blind increment — and the candidate is then verified
-    against both ``Invoice.code`` and ``Invoice.id`` before it is returned, so
-    ``db.commit()`` receives a collision-free code. Taken candidates roll the
-    sequence forward; if the sequential block is somehow exhausted, a short
-    random suffix guarantees freshness.
-    """
-
-    rows = (
-        db.query(Invoice.code, Invoice.id)
-        .filter(
-            or_(
-                Invoice.code.like(f"{INVOICE_PREFIX}%"),
-                Invoice.id.like(f"{INVOICE_PREFIX}%"),
-            )
-        )
-        .all()
-    )
-
-    candidates: list[str | None] = []
-    for code, invoice_id in rows:
-        candidates.extend((code, invoice_id))
-    sequence = _max_numeric_suffix(candidates, INVOICE_PREFIX)
-
-    # Roll the sequence forward past any explicit collision.
-    for _ in range(100):
-        candidate = f"{INVOICE_PREFIX}{sequence + 1:04d}"
-        if not _code_is_taken(db, candidate):
-            return candidate
-        sequence += 1
-
-    # Deterministic allocation failed: fall back to a short random suffix so
-    # the insert still gets a unique code (e.g. ``NPL-2026-0101-9F3A``).
-    # Bounded: a 16-bit suffix collides with probability ~2^-16 per draw, so
-    # 25 attempts are statistically certain; anything beyond that means the
-    # uniqueness oracle itself is broken and must surface as a hard error
-    # instead of a silent hang.
-    for _ in range(25):
-        fallback = (
-            f"{INVOICE_PREFIX}{sequence + 1:04d}-{secrets.token_hex(2).upper()}"
-        )
-        if not _code_is_taken(db, fallback):
-            return fallback
-
-    raise RuntimeError(
-        "Could not allocate a unique invoice code after sequential and "
-        "random-suffix allocation attempts."
-    )
+    return generate_guaranteed_unique_code(db, Invoice, "NPL")
 
 
 DELIVERY_NOTE_PREFIX = "ISP-2026-"
 
 
 def _next_delivery_note_code(db: Session) -> str:
-    """Allocate the next unique ``ISP-2026-XXXX`` delivery-note code."""
+    """Allocate the next unique e-Ispratnica (delivery note) code."""
 
-    rows = db.query(DeliveryNote.code).filter(
-        DeliveryNote.code.like(f"{DELIVERY_NOTE_PREFIX}%")
-    )
-    sequence = _max_numeric_suffix((code for (code,) in rows), DELIVERY_NOTE_PREFIX)
-
-    # Roll the sequence forward past any explicit collision.
-    for _ in range(100):
-        candidate = f"{DELIVERY_NOTE_PREFIX}{sequence + 1:04d}"
-        if (
-            db.query(DeliveryNote.id)
-            .filter(DeliveryNote.code == candidate)
-            .first()
-            is None
-        ):
-            return candidate
-        sequence += 1
-
-    # Deterministic allocation failed: short random suffix guarantees freshness.
-    for _ in range(25):
-        fallback = (
-            f"{DELIVERY_NOTE_PREFIX}{sequence + 1:04d}-{secrets.token_hex(2).upper()}"
-        )
-        if (
-            db.query(DeliveryNote.id)
-            .filter(DeliveryNote.code == fallback)
-            .first()
-            is None
-        ):
-            return fallback
-
-    raise RuntimeError(
-        "Could not allocate a unique delivery-note code after sequential and "
-        "random-suffix allocation attempts."
-    )
+    return generate_guaranteed_unique_code(db, DeliveryNote, "ISP")
 
 
 def _find_delivery_note(
@@ -1110,6 +1109,34 @@ app.add_middleware(
 )
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+# ---------------------------------------------------------------------------
+# Global JSON error guardrail
+# ---------------------------------------------------------------------------
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(
+    request: Request, exc: Exception
+) -> JSONResponse:
+    """Last-resort guardrail: unexpected server errors must never surface as
+    raw HTML/plain-text pages that crash the SPA with ``Unexpected token '<'``.
+
+    Every unhandled exception is logged with its stack trace and returned as a
+    JSON 500 with a stable shape (``detail`` + ``message``). Request-scoped
+    database sessions are closed (and thus their transactions released) by the
+    ``get_db`` dependency teardown; endpoints that hold a session wrap their
+    own bodies with ``db.rollback()`` for Supabase connection-lock hygiene.
+    """
+
+    logger.exception(
+        "Unhandled server error on %s %s", request.method, request.url.path
+    )
+    return JSONResponse(
+        status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": str(exc), "message": "Failed to process request"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1698,6 +1725,30 @@ def create_invoice(
     payload: InvoiceCreateRequest,
     db: DbSession,
     current_user: CurrentUser,
+) -> dict[str, Any] | JSONResponse:
+    """JSON-guardrail wrapper: any unexpected failure rolls the session back
+    (releasing Supabase connection locks) and returns a JSON 500 instead of an
+    HTML/plain-text error page that would crash the frontend's ``res.json()``.
+    """
+
+    try:
+        return _create_invoice_impl(payload, db, current_user)
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:  # noqa: BLE001 - converted to a JSON 500
+        db.rollback()
+        logger.exception("Invoice creation failed unexpectedly")
+        return JSONResponse(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": str(exc), "message": "Failed to process request"},
+        )
+
+
+def _create_invoice_impl(
+    payload: InvoiceCreateRequest,
+    db: Session,
+    current_user: CurrentUser,
 ) -> dict[str, Any]:
     """Create a VAT-inclusive invoice for current user and allocate its code."""
 
@@ -2024,35 +2075,87 @@ def create_delivery_note(
     payload: DeliveryNoteCreateRequest,
     db: DbSession,
     current_user: CurrentUser,
-) -> dict[str, Any]:
-    """Create a new e-Ispratnica with digital signature and file to UJP."""
-    note_code = _next_delivery_note_code(db)
-    issue = payload.issue_date or datetime.utcnow().date()
-    note = DeliveryNote(
-        code=note_code,
-        user_id=current_user.id,
-        invoice_id=payload.invoice_id,
-        recipient_name=payload.client_name,
-        client_name=payload.client_name,
-        delivery_address=payload.delivery_address,
-        items_description=payload.items_description,
-        issue_date=issue,
-        details=payload.items_description,
-        signature_data=payload.signature_data,
-        is_signed=True,
-        signed_at=datetime.utcnow(),
-        ujp_status="Sent to UJP",
-    )
-    db.add(note)
+) -> dict[str, Any] | JSONResponse:
+    """JSON-guardrail wrapper for e-Ispratnica creation (same contract as
+    ``create_invoice``: rollback on failure, JSON 500, never raw HTML)."""
+
     try:
-        db.commit()
-        db.refresh(note)
-    except SQLAlchemyError as exc:
+        return _create_delivery_note_impl(payload, db, current_user)
+    except HTTPException:
         db.rollback()
-        logger.exception("Delivery note creation failed")
-        raise HTTPException(status_code=500, detail="Could not create delivery note.") from exc
-    logger.info("e-Ispratnica %s filed to UJP (simulated).", note_code)
-    return _serialize_delivery_note(note)
+        raise
+    except Exception as exc:  # noqa: BLE001 - converted to a JSON 500
+        db.rollback()
+        logger.exception("Delivery-note creation failed unexpectedly")
+        return JSONResponse(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": str(exc), "message": "Failed to process request"},
+        )
+
+
+def _create_delivery_note_impl(
+    payload: DeliveryNoteCreateRequest,
+    db: Session,
+    current_user: CurrentUser,
+) -> dict[str, Any]:
+    """Create a new e-Ispratnica with digital signature and file to UJP.
+
+    The code is allocated with ``generate_guaranteed_unique_code`` immediately
+    before the model is constructed, and the insert is retried with a freshly
+    regenerated code when the database reports a unique-constraint collision
+    (e.g. a concurrent writer won the same sequence number).
+    """
+
+    issue = payload.issue_date or datetime.utcnow().date()
+    collision: IntegrityError | None = None
+
+    for attempt in range(1, MAX_CODE_ALLOCATION_ATTEMPTS + 1):
+        note_code = _next_delivery_note_code(db)
+        note = DeliveryNote(
+            code=note_code,
+            user_id=current_user.id,
+            invoice_id=payload.invoice_id,
+            recipient_name=payload.client_name,
+            client_name=payload.client_name,
+            delivery_address=payload.delivery_address,
+            items_description=payload.items_description,
+            issue_date=issue,
+            details=payload.items_description,
+            signature_data=payload.signature_data,
+            is_signed=True,
+            signed_at=datetime.utcnow(),
+            ujp_status="Sent to UJP",
+        )
+        db.add(note)
+        try:
+            db.commit()
+            db.refresh(note)
+        except IntegrityError as exc:
+            db.rollback()
+            collision = exc
+            logger.warning(
+                "Delivery-note code collision on attempt %d; regenerating.", attempt
+            )
+            continue
+        except SQLAlchemyError as exc:
+            db.rollback()
+            logger.exception("Delivery note creation failed")
+            raise HTTPException(
+                status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Could not create delivery note.",
+            ) from exc
+
+        logger.info("e-Ispratnica %s filed to UJP (simulated).", note_code)
+        return _serialize_delivery_note(note)
+
+    logger.exception(
+        "Could not persist delivery note after %d attempt(s)",
+        MAX_CODE_ALLOCATION_ATTEMPTS,
+    )
+    raise HTTPException(
+        status_code=http_status.HTTP_409_CONFLICT,
+        detail="Delivery note could not be stored; the generated code is already in use.",
+    ) from collision
 
 
 @app.post("/api/ispratnica/{code}/sign", response_model=SignResponse)

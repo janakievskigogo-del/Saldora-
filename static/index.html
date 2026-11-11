@@ -3675,6 +3675,36 @@
       return response;
     }
 
+    /**
+     * Safely extract a human-readable error message from a failed response.
+     * Never calls response.json() on non-JSON bodies (e.g. proxy HTML error
+     * pages), which would crash with `Unexpected token '<'`.
+     */
+    async function readApiError(response, fallbackMessage) {
+      const contentType = response.headers ? (response.headers.get('content-type') || '') : '';
+      if (contentType.includes('application/json')) {
+        try {
+          const err = await response.clone().json();
+          const detail = err && err.detail !== undefined ? err.detail : (err && err.message);
+          if (typeof detail === 'string' && detail.trim()) return detail;
+          if (Array.isArray(detail)) {
+            const joined = detail.map(item => item && item.msg).filter(Boolean).join(', ');
+            if (joined) return joined;
+          }
+        } catch (parseError) {
+          // Malformed JSON body: fall through to the text branch below.
+        }
+      }
+      let text = '';
+      try {
+        text = (await response.text()).trim();
+      } catch (readError) {
+        text = '';
+      }
+      const snippet = text ? ` — ${text.slice(0, 160)}` : '';
+      return `${fallbackMessage} (HTTP ${response.status}${snippet})`;
+    }
+
     // -------------------------------------------------------------------------
     // Documenso settings (API key is stored encrypted on the server)
     // -------------------------------------------------------------------------
@@ -5362,8 +5392,7 @@
           body: JSON.stringify(payload)
         });
         if (!res.ok) {
-          const err = await res.json();
-          throw new Error(err.detail || 'Грешка при креирање фактура');
+          throw new Error(await readApiError(res, 'Грешка при креирање фактура'));
         }
         const created = await res.json();
         showToast(`Креирана фактура ${created.code} со генериран UBL 2.1 XML`, 'success');
@@ -5417,14 +5446,7 @@
           body: JSON.stringify(payload)
         });
         if (!res.ok) {
-          const err = await res.json().catch(() => ({}));
-          const detail = err.detail;
-          const message = typeof detail === 'string'
-            ? detail
-            : Array.isArray(detail)
-              ? detail.map(item => item.msg).filter(Boolean).join(', ')
-              : 'Грешка при креирање на испратница';
-          throw new Error(message);
+          throw new Error(await readApiError(res, 'Грешка при креирање на испратница'));
         }
         const created = await res.json();
         showToast(`е-Испратницата ${created.code} е креирана`, 'success');
